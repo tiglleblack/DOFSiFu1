@@ -26,6 +26,8 @@ namespace DfoServer.Game.Inventory
 
         public int RemainingCount { get; set; }
 
+        public ItemCore SourceSnapshot { get; set; }
+
         public InventoryMutationSet Changes { get; } = new InventoryMutationSet();
     }
 
@@ -44,13 +46,16 @@ namespace DfoServer.Game.Inventory
             if (!inventory.TryGetItem(listType, slotIndex, out var source) || source == null)
                 return Fail(result, InventoryDeleteError.SourceNotFound);
 
+            var sourceSnapshot = source.Copy();
+
             if (!inventory.RemoveItem(listType, slotIndex))
                 return Fail(result, InventoryDeleteError.RemoveFailed);
 
-            RemoveOwnedDetail(inventory, source);
+            RemoveOwnedDetail(inventory, sourceSnapshot);
             result.Success = true;
             result.DeletedCount = 1;
             result.RemainingCount = 0;
+            result.SourceSnapshot = sourceSnapshot;
             result.Changes.AddSlot(listType, slotIndex);
             return true;
         }
@@ -78,15 +83,18 @@ namespace DfoServer.Game.Inventory
             if (source.Count < count)
                 return Fail(result, InventoryDeleteError.NotEnoughCount);
 
+            var sourceSnapshot = source.Copy();
+
             if (source.Count == count)
             {
                 if (!inventory.RemoveItem(listType, slotIndex))
                     return Fail(result, InventoryDeleteError.RemoveFailed);
 
-                RemoveOwnedDetail(inventory, source);
+                RemoveOwnedDetail(inventory, sourceSnapshot);
                 result.Success = true;
                 result.DeletedCount = count;
                 result.RemainingCount = 0;
+                result.SourceSnapshot = sourceSnapshot;
                 result.Changes.AddSlot(listType, slotIndex);
                 return true;
             }
@@ -99,6 +107,7 @@ namespace DfoServer.Game.Inventory
             result.Success = true;
             result.DeletedCount = count;
             result.RemainingCount = updated.Count;
+            result.SourceSnapshot = sourceSnapshot;
             result.Changes.AddSlot(listType, slotIndex);
             return true;
         }
@@ -124,6 +133,51 @@ namespace DfoServer.Game.Inventory
             return TryDecreaseStack(inventory, listType, slotIndex, count, out result);
         }
 
+        internal static bool TryDeleteMainItemsByTemplateId(
+            InventoryService inventory,
+            int itemId,
+            int count,
+            out InventoryMutationSet changes)
+        {
+            changes = new InventoryMutationSet();
+            if (inventory == null || itemId <= 0 || count <= 0)
+                return false;
+            if (inventory.CountMainItem(itemId) < count)
+                return false;
+
+            var remaining = count;
+            foreach (var pair in inventory.GetItems(InventoryListType.Main))
+            {
+                if (remaining <= 0)
+                    break;
+
+                var item = pair.Value;
+                if (item == null || item.ItemId != itemId)
+                    continue;
+
+                var available = InventoryStackRuleService.IsStackable(item)
+                    ? Math.Max(0, item.Count)
+                    : 1;
+                var deleteCount = Math.Min(remaining, available);
+                if (deleteCount <= 0
+                    || !TryDecreaseStack(
+                        inventory,
+                        InventoryListType.Main,
+                        pair.Key,
+                        deleteCount,
+                        out var deleted)
+                    || !deleted.Success)
+                {
+                    return false;
+                }
+
+                changes.AddRange(deleted.Changes);
+                remaining -= deleted.DeletedCount;
+            }
+
+            return remaining == 0;
+        }
+
         internal static bool TryDeleteForClient(
             InventoryService inventory,
             InventoryListType listType,
@@ -142,6 +196,50 @@ namespace DfoServer.Game.Inventory
             out InventoryMutationResult mutation)
         {
             return TryDeleteForClient(inventory, listType, slotIndex, 1, expectedItemId, out mutation);
+        }
+
+        internal static bool CanUseStackableForClient(
+            InventoryService inventory,
+            InventoryListType listType,
+            short slotIndex,
+            int expectedItemId,
+            out int resolvedItemId)
+        {
+            resolvedItemId = 0;
+            if (inventory == null)
+                return false;
+
+            if (listType == InventoryListType.Main
+                && InventoryService.IsVirtualMainSlot(slotIndex))
+            {
+                if (!InventoryService.TryResolveMainVirtualItemId(
+                        slotIndex,
+                        out resolvedItemId)
+                    || (expectedItemId > 0
+                        && expectedItemId != resolvedItemId))
+                {
+                    return false;
+                }
+
+                return (inventory.GetMainVirtualCount(slotIndex)?.Count ?? 0) > 0;
+            }
+
+            if (!IsSupportedClientDeleteListType(listType))
+                return false;
+
+            var source = inventory.GetItem(listType, slotIndex);
+            if (source == null
+                || source.IsEmpty
+                || source.Count <= 0
+                || !InventoryStackRuleService.IsStackable(source)
+                || (expectedItemId > 0 && source.ItemId != expectedItemId)
+                || IsItemLocked(inventory, source))
+            {
+                return false;
+            }
+
+            resolvedItemId = source.ItemId;
+            return true;
         }
 
         private static bool TryDeleteForClient(
@@ -180,7 +278,12 @@ namespace DfoServer.Game.Inventory
                 || !deleteResult.Success)
                 return false;
 
-            mutation = CreateMutation(listType, slotIndex, source, requestedCount, deleteResult);
+            mutation = CreateMutation(
+                listType,
+                slotIndex,
+                deleteResult.SourceSnapshot,
+                requestedCount,
+                deleteResult);
             return true;
         }
 

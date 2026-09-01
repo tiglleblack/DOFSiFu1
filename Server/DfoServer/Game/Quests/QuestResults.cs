@@ -10,7 +10,12 @@ namespace DfoServer.Game.Quests
     {
         public byte ErrorCode;
         public ushort QuestId;
+        // ACCEPT ACK 先用 PVF/QST 初值建立客户端任务模型。
         public uint InitTrigger;
+        // 事务内按角色当前状态校准并实际落库的权威值。
+        public uint CommittedTrigger;
+        // 两者不同时，由网络适配层在 ACCEPT ACK 后投影一次 SET_TRIGGER。
+        public QuestSetTriggerResult PostAcceptTriggerProjection;
         public List<QuestEventItemGrant> EventItems = new List<QuestEventItemGrant>();
 
         public bool Success => ErrorCode == 0;
@@ -30,6 +35,8 @@ namespace DfoServer.Game.Quests
     {
         public byte ErrorCode;
         public ushort QuestId;
+        internal InventoryMutationSet InventoryChanges { get; } =
+            new InventoryMutationSet();
 
         public bool Success => ErrorCode == 0;
 
@@ -59,6 +66,9 @@ namespace DfoServer.Game.Quests
         public uint GrowthCapsuleExp;
         public uint TotalGrowthCapsuleExp;
         public uint Gold;
+        // FINISH_QUEST ACK 的第二个 u32 是本次完成次数，不是金币。
+        // 金币由后续 itemId=0 的 InsertedEntries 记录投影给客户端。
+        public uint CompletionCount;
         // 经验结算后的等级与总经验(与奖励同一事务已落库; Exp 为 0 时等于结算前取值)。
         public byte NewLevel;
         public uint NewExp;

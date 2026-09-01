@@ -10,8 +10,6 @@ namespace DfoServer.Game.Inventory
     internal static class InventoryItemUpgradeService
     {
         private const int WeightScale = 100000;
-        private const int DefaultDestroyRewardItemId = 3037;
-        private const int DefaultDestroyRewardCount = 1;
         private static readonly ItemSlotRange QuickSlotRange = new ItemSlotRange(3, 8);
 
         internal static bool TryUpgradeItem(
@@ -28,6 +26,12 @@ namespace DfoServer.Game.Inventory
             result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorInvalidTarget);
             if (inventory == null)
                 return false;
+
+            if (!TryResolveTableKind(command.Method, command.Mode, out var tableKind))
+            {
+                result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorWrongUpgradeMode);
+                return false;
+            }
 
             var target = inventory.GetItem(InventoryListType.Main, command.TargetSlotIndex);
             if (target == null
@@ -73,7 +77,8 @@ namespace DfoServer.Game.Inventory
             }
 
             var amplify = ResolveAmplifyState(target);
-            if (command.Mode == ItemUpgradeMode.Reinforce && amplify.HasAmplifyAttribute)
+            if (command.Mode == ItemUpgradeMode.Reinforce
+                && (amplify.HasUnidentifiedOutworldVigor || amplify.HasAmplifyAttribute))
             {
                 result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorWrongUpgradeMode);
                 return false;
@@ -81,6 +86,12 @@ namespace DfoServer.Game.Inventory
 
             if (command.Mode == ItemUpgradeMode.Amplify)
             {
+                if (amplify.HasUnidentifiedOutworldVigor)
+                {
+                    result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorAmplifyNotIdentified);
+                    return false;
+                }
+
                 if (!amplify.HasAmplifyAttribute)
                 {
                     result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorWrongUpgradeMode);
@@ -101,11 +112,10 @@ namespace DfoServer.Game.Inventory
                 return false;
             }
 
-            var tableKind = command.Mode == ItemUpgradeMode.Amplify
-                ? ItemUpgradeTableKind.Amplify
-                : ItemUpgradeTableKind.Normal;
             var material = inventory.GetItem(InventoryListType.Main, command.MaterialSlotIndex);
-            var materialConfig = ResolveMaterialConfig(material);
+            var materialConfig = tableKind == ItemUpgradeTableKind.Advanced
+                ? null
+                : ResolveMaterialConfig(material);
 
             if (!TryBuildContext(
                     command,
@@ -127,6 +137,9 @@ namespace DfoServer.Game.Inventory
                 result = ItemUpgradeResult.Error(command, errorCode);
                 return false;
             }
+
+            context.EquippedUpgradeProbabilityIncrease =
+                ResolveEquippedUpgradeProbabilityIncrease(inventory);
 
             if (!ValidateMaterial(inventory, command.MaterialSlotIndex, material, context.Cost, out errorCode))
             {
@@ -185,6 +198,37 @@ namespace DfoServer.Game.Inventory
 
             var resultCode = success ? (byte)0 : (byte)Math.Max(1, effectivePenaltyType);
 
+            var destroyRewardRequests = new List<InventoryRewardGrantRequest>();
+            InventoryRewardGrantBatchPlan destroyRewardPlan = null;
+            if (destroyed)
+            {
+                foreach (var bonus in ItemUpgradeTableProvider.CalculateDestroyBonuses(
+                    tableKind,
+                    chance.TargetLevel,
+                    targetMetadata.Grade,
+                    targetMetadata.Rarity))
+                {
+                    if (bonus.HasValue)
+                    {
+                        destroyRewardRequests.Add(InventoryRewardGrantRequest.Create(
+                            bonus.ItemId,
+                            bonus.Count,
+                            ItemCreateReason.Unknown));
+                    }
+                }
+
+                if (destroyRewardRequests.Count > 0
+                    && (!InventoryRewardGrantService.TryPlanBatch(
+                            inventory,
+                            destroyRewardRequests,
+                            out destroyRewardPlan)
+                        || !destroyRewardPlan.Success))
+                {
+                    result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorInventoryFull);
+                    return false;
+                }
+            }
+
             if (!ConsumeMaterial(inventory, command.MaterialSlotIndex, material, context.Cost, out var materialUpdate))
             {
                 result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorInvalidMaterial);
@@ -210,8 +254,10 @@ namespace DfoServer.Game.Inventory
                 return false;
             }
 
+            ItemCore targetItemSnapshot;
             if (destroyed)
             {
+                targetItemSnapshot = target.Copy();
                 if (!inventory.RemoveItem(InventoryListType.Main, command.TargetSlotIndex))
                 {
                     result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorInvalidTarget);
@@ -227,36 +273,42 @@ namespace DfoServer.Game.Inventory
                     result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorInvalidTarget);
                     return false;
                 }
+                targetItemSnapshot = updatedTarget;
             }
 
-            ItemUpgradeSlotCount destroyRewardUpdate = null;
+            var destroyRewardItems = new List<ItemUpgradeRewardItem>();
             if (destroyed)
             {
-                if (!InventoryRewardGrantService.TryCreateAndInsert(
-                        inventory,
-                        DefaultDestroyRewardItemId,
-                        ItemCreateReason.Unknown,
-                        DefaultDestroyRewardCount,
-                        out var rewardGrant))
+                InventoryRewardGrantBatchResult rewardBatch = null;
+                if (destroyRewardRequests.Count > 0
+                    && (!InventoryRewardGrantService.TryApplyPreparedBatch(
+                            inventory,
+                            destroyRewardPlan,
+                            out rewardBatch)
+                        || !rewardBatch.Success
+                        || rewardBatch.Results.Count != destroyRewardRequests.Count))
                 {
                     result = ItemUpgradeResult.Error(command, ItemUpgradeResult.ErrorInventoryFull);
                     return false;
                 }
 
-                destroyRewardUpdate = CreateSlotCount(
-                    rewardGrant.SlotIndex,
-                    DefaultDestroyRewardItemId,
-                    rewardGrant.FinalCount);
-                if (materialUpdate != null
-                    && materialUpdate.ItemTemplateId == DefaultDestroyRewardItemId
-                    && materialUpdate.SlotIndex == destroyRewardUpdate.SlotIndex)
-                    materialUpdate = destroyRewardUpdate;
+                for (var index = 0; index < destroyRewardRequests.Count; index++)
+                {
+                    var rewardGrant = rewardBatch.Results[index];
+                    destroyRewardItems.Add(new ItemUpgradeRewardItem
+                    {
+                        SlotIndex = rewardGrant.SlotIndex,
+                        ItemTemplateId = rewardGrant.ItemTemplateId,
+                        Count = rewardGrant.GrantedCount,
+                    });
+                }
             }
 
             var upgradeResult = new ItemUpgradeResult
             {
                 Command = command,
                 Success = true,
+                Method = command.Method,
                 Mode = command.Mode,
                 Scene = context.Scene,
                 TargetSlotIndex = command.TargetSlotIndex,
@@ -275,6 +327,7 @@ namespace DfoServer.Game.Inventory
                 NoticeRequired = success
                     ? ItemUpgradeTableProvider.IsNoticeLevel(tableKind, newLevel)
                     : ItemUpgradeTableProvider.IsNoticeLevel(tableKind, oldLevel),
+                TargetItemSnapshot = targetItemSnapshot,
             };
 
             AddRefreshSlot(upgradeResult.MainRefreshSlots, command.TargetSlotIndex);
@@ -282,21 +335,36 @@ namespace DfoServer.Game.Inventory
                 AddRefreshSlot(upgradeResult.MainRefreshSlots, materialUpdate.SlotIndex);
             if (protectTicketUpdate != null)
                 AddRefreshSlot(upgradeResult.MainRefreshSlots, protectTicketUpdate.SlotIndex);
-            if (destroyRewardUpdate != null)
-                AddRefreshSlot(upgradeResult.MainRefreshSlots, destroyRewardUpdate.SlotIndex);
-
-            if (destroyRewardUpdate != null)
+            foreach (var reward in destroyRewardItems)
             {
-                upgradeResult.DestroyRewardItems.Add(new ItemUpgradeRewardItem
-                {
-                    SlotIndex = destroyRewardUpdate.SlotIndex,
-                    ItemTemplateId = DefaultDestroyRewardItemId,
-                    Count = DefaultDestroyRewardCount,
-                });
+                AddRefreshSlot(upgradeResult.MainRefreshSlots, reward.SlotIndex);
+                upgradeResult.DestroyRewardItems.Add(reward);
             }
 
             result = upgradeResult;
             return true;
+        }
+
+        private static bool TryResolveTableKind(
+            ItemUpgradeMethod method,
+            ItemUpgradeMode mode,
+            out ItemUpgradeTableKind tableKind)
+        {
+            switch (method)
+            {
+                case ItemUpgradeMethod.Reinforce:
+                    tableKind = ItemUpgradeTableKind.Normal;
+                    return mode == ItemUpgradeMode.Reinforce;
+                case ItemUpgradeMethod.Amplify:
+                    tableKind = ItemUpgradeTableKind.Amplify;
+                    return mode == ItemUpgradeMode.Amplify;
+                case ItemUpgradeMethod.AdvancedReinforce:
+                    tableKind = ItemUpgradeTableKind.Advanced;
+                    return mode == ItemUpgradeMode.Reinforce;
+                default:
+                    tableKind = ItemUpgradeTableKind.Normal;
+                    return false;
+            }
         }
 
         private static bool TryBuildContext(
@@ -576,9 +644,30 @@ namespace DfoServer.Game.Inventory
             if (context.Scene == ItemUpgradeScene.Ticket)
                 return baseWeight;
 
-            var weight = baseWeight + context.SuccessRateAddWeight;
-            weight = (int)((long)weight * (WeightScale + context.SuccessRateBonusWeight) / WeightScale);
-            return Clamp(weight, 0, WeightScale);
+            var additiveWeight = (long)baseWeight
+                + context.SuccessRateAddWeight
+                + context.EquippedUpgradeProbabilityIncrease;
+            additiveWeight = Math.Max(0L, Math.Min(WeightScale, additiveWeight));
+
+            var multiplierWeight = Math.Max(0L, WeightScale + (long)context.SuccessRateBonusWeight);
+            var finalWeight = additiveWeight * multiplierWeight / WeightScale;
+            return (int)Math.Max(0L, Math.Min(WeightScale, finalWeight));
+        }
+
+        private static int ResolveEquippedUpgradeProbabilityIncrease(InventoryService inventory)
+        {
+            var title = inventory?.GetItem(
+                InventoryListType.Equipment,
+                (short)EquipmentType.TitleName);
+            if (title == null
+                || title.ItemKind != ItemCore.KindEquipment
+                || !ItemMetadataResolver.TryLoadEquipmentFile(title.ItemId, out var equipment)
+                || EquipmentTypeInfo.ParseOrUnknown(equipment.EquipmentType) != EquipmentType.TitleName)
+            {
+                return 0;
+            }
+
+            return Math.Max(0, equipment.UpgradeProbabilityIncrease);
         }
 
         private static int ResolvePenaltyType(ItemUpgradeContext context, UpgradeTableRow row, ItemUpgradeTableKind tableKind)
@@ -658,12 +747,14 @@ namespace DfoServer.Game.Inventory
 
             var rawType = item.AmplifyType;
             var type = (byte)(rawType & 0x7F);
+            var hasUnidentifiedOutworldVigor = (rawType & 0x80) != 0;
             var hasAttribute = type >= (byte)AmplifyAttributeType.Vitality
                 && type <= (byte)AmplifyAttributeType.Intelligence;
             return new AmplifyState
             {
+                HasUnidentifiedOutworldVigor = hasUnidentifiedOutworldVigor,
                 HasAmplifyAttribute = hasAttribute,
-                IsIdentified = hasAttribute && (rawType & 0x80) == 0 && item.AmplifyValue > 0,
+                IsIdentified = hasAttribute && !hasUnidentifiedOutworldVigor && item.AmplifyValue > 0,
             };
         }
 
@@ -742,6 +833,8 @@ namespace DfoServer.Game.Inventory
 
         private struct AmplifyState
         {
+            public bool HasUnidentifiedOutworldVigor { get; set; }
+
             public bool HasAmplifyAttribute { get; set; }
 
             public bool IsIdentified { get; set; }

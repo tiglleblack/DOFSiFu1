@@ -47,7 +47,12 @@ namespace DfoServer.Network.Builders
 
         public static void WriteCommonEntry84(GamePacketWriter writer, short slot, ItemCore core)
         {
-            WriteEntry84(writer, slot, core, core?.Value ?? 0, core?.Marker16 ?? ItemCore.Marker16Default);
+            WriteEntry84(
+                writer,
+                slot,
+                core,
+                core?.Value ?? 0,
+                ResolveCommonMarker16(core));
         }
 
         public static void WriteAvatarEntry126(
@@ -60,7 +65,12 @@ namespace DfoServer.Network.Builders
                 throw new ArgumentNullException(nameof(core));
 
             var remainingSeconds = avatarDetail?.GetRemainDate() ?? 0;
-            WriteEntry84(writer, slot, core, remainingSeconds, core.Marker16);
+            WriteEntry84(
+                writer,
+                slot,
+                core,
+                remainingSeconds,
+                ResolveZeroDefaultMarker16(core.Marker16));
             writer.WriteInt32(JewelSocket.Size);
             WriteFixedBytes(writer, avatarDetail?.JewelSocket, JewelSocket.Size);
             writer.WriteInt32(4);
@@ -70,7 +80,13 @@ namespace DfoServer.Network.Builders
 
         public static void WritePetEntry84(GamePacketWriter writer, short slot, ItemCore core)
         {
-            WriteEntry84(writer, slot, core, core?.Value ?? 0, core?.Marker16 ?? ItemCore.Marker16Default);
+            WriteEntry84(
+                writer,
+                slot,
+                core,
+                core?.Value ?? 0,
+                ResolveZeroDefaultMarker16(
+                    core?.Marker16 ?? ItemCore.Marker16Default));
         }
 
         public static void WritePetCreatureEntry84(
@@ -188,29 +204,7 @@ namespace DfoServer.Network.Builders
 
         private static void WriteNoti2RandomOptionBlock(GamePacketWriter writer, ItemCore core)
         {
-            var options = core.RandomOptions;
-            var count = Math.Min(3, options.Count);
-            writer.WriteByte((byte)count);
-            for (var index = 0; index < count; index++)
-            {
-                writer.WriteByte(options[index].Type);
-                writer.WriteByte(options[index].Value1);
-                writer.WriteByte(options[index].Value2);
-            }
-
-            if (count <= 0)
-                return;
-
-            var changedIndex = ResolveNoti2RandomOptionChangedIndex(core);
-            writer.WriteByte(core.RandomOptionState);
-            writer.WriteByte(changedIndex);
-            if (changedIndex == ItemCore.RandomOptionChangedIndexDefault)
-                return;
-
-            writer.WriteByte(core.RandomOptionChangeState);
-            writer.WriteByte(core.RandomOptionChange.Type);
-            writer.WriteByte(core.RandomOptionChange.Value1);
-            writer.WriteByte(core.RandomOptionChange.Value2);
+            RandomOptionProtocolWriter.WriteDynamic(writer, core);
         }
 
         private static void WriteNoti2TailBlock(GamePacketWriter writer, ItemCore core)
@@ -254,6 +248,24 @@ namespace DfoServer.Network.Builders
                 : unchecked((uint)core.Marker16);
         }
 
+        private static int ResolveCommonMarker16(ItemCore core)
+        {
+            if (core == null)
+                return ItemCore.Marker16Default;
+
+            // Equipment uses -1 as a meaningful wire sentinel. Legacy
+            // stackable/material entries used zero, even though the unified
+            // item_core representation stores their missing value as -1.
+            return core.ItemKind == ItemCore.KindEquipment
+                ? core.Marker16
+                : ResolveZeroDefaultMarker16(core.Marker16);
+        }
+
+        private static int ResolveZeroDefaultMarker16(int marker16)
+        {
+            return marker16 == ItemCore.Marker16Default ? 0 : marker16;
+        }
+
         private static int ResolvePetCreatureMarker16(ItemCore core, CreatureDetail creatureDetail)
         {
             var remainingSeconds = CreatureDetail.GetStaticRemainDate(core.ItemId);
@@ -275,23 +287,6 @@ namespace DfoServer.Network.Builders
             return core.ExpireTime > 0
                 ? CreatureDetail.GetRemainDate(core.ExpireTime)
                 : 0;
-        }
-
-        private static byte ResolveNoti2RandomOptionChangedIndex(ItemCore core)
-        {
-            return HasExplicitNoti2RandomOptionTail(core)
-                ? core.RandomOptionChangedIndex
-                : ItemCore.RandomOptionChangedIndexDefault;
-        }
-
-        private static bool HasExplicitNoti2RandomOptionTail(ItemCore core)
-        {
-            return core.RandomOptionState != 0
-                || core.RandomOptionChangedIndex != 0
-                || core.RandomOptionChangeState != 0
-                || core.RandomOptionChange.Type != 0
-                || core.RandomOptionChange.Value1 != 0
-                || core.RandomOptionChange.Value2 != 0;
         }
 
         private static void WriteChronicleBlock(GamePacketWriter writer, ItemCore core)

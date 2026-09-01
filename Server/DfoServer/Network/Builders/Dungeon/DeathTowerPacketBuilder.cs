@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
+using DfoServer.Game.DeathTower;
 using DfoServer.Network;
 
-namespace DfoServer.Game.DeathTower
+namespace DfoServer.Network.Builders
 {
     // 塔专属包构建(NOTI 142/143/144/145/146)。字段定义全部来自 86JP IDA 汇编定案。
     public static class DeathTowerPacketBuilder
@@ -71,13 +72,17 @@ namespace DfoServer.Game.DeathTower
             return w.ToArray();
         }
 
-        // NOTI 144 DEATH_TOWER_STATE_RANKING (安全版: 空排行, 两个86JP新增flag=0)
-        public static byte[] BuildEmptyRanking(int dungeonId)
+        // NOTI 144 DEATH_TOWER_STATE_RANKING. Personal and global rankings
+        // remain empty until their layouts have independent protocol evidence.
+        public static byte[] BuildRanking(
+            int dungeonId,
+            int clearedFloorCount,
+            int clearTimeMilliseconds)
         {
             var w = new GamePacketWriter();
             w.WriteByte(0);                 // flag0 (86JP新增, 语义未知, 0安全)
-            w.WriteUInt32(0);               // clearTime
-            w.WriteUInt32(0);               // playTime
+            w.WriteInt32(Math.Max(0, clearTimeMilliseconds));
+            w.WriteInt32(Math.Max(0, clearedFloorCount));
             w.WriteByte(0);                 // flag3 (86JP新增, 语义未知, 0安全)
             w.WriteUInt32((uint)dungeonId); // dungeonIdx
             w.WriteByte(0);                 // hasMyBestRecord = false
@@ -99,61 +104,39 @@ namespace DfoServer.Game.DeathTower
         }
 
         // NOTI 145 DEATH_TOWER_STATE_REWARD (变长, 双端闭环: summary + 4组×{count+items})
-        public static byte[] BuildEmptyReward()
-        {
-            return BuildReward(0, null);
-        }
-
         // Client handler (86JP DNF.exe RVA 0x008F7230):
         // u32 summary + 4 * { u8 count + count * { u32 itemId + u32 stackCount } }.
         public static byte[] BuildReward(
-            uint summaryValue,
-            IReadOnlyList<IReadOnlyList<DeathTowerRewardItem>> groups)
+            int rewardExp,
+            IReadOnlyList<DeathTowerRewardCandidate> candidates)
         {
             var w = new GamePacketWriter();
-            w.WriteUInt32(summaryValue);
+            w.WriteInt32(Math.Max(0, rewardExp));
             for (var groupIndex = 0; groupIndex < 4; groupIndex++)
             {
-                var group = groups != null && groupIndex < groups.Count
-                    ? groups[groupIndex]
-                    : null;
+                var group = groupIndex == 0 ? candidates : null;
                 var count = Math.Min(byte.MaxValue, group?.Count ?? 0);
                 w.WriteByte((byte)count);
                 for (var itemIndex = 0; itemIndex < count; itemIndex++)
                 {
                     var item = group[itemIndex];
-                    w.WriteUInt32((uint)Math.Max(0, item.ItemId));
-                    w.WriteUInt32((uint)Math.Max(1, item.Count));
+                    w.WriteInt32(item.ItemId);
+                    w.WriteInt32(item.AddInfo);
                 }
             }
             return w.ToArray();
         }
 
         // NOTI 146 DEATH_TOWER_STATE_EPLP (1B, 双端闭环)
-        public static byte[] BuildEplp(bool cleared)
+        public static byte[] BuildEplp(bool allMembersHaveRequiredItem)
         {
-            return new byte[] { cleared ? (byte)1 : (byte)0 };
+            return new byte[] { allMembersHaveRequiredItem ? (byte)1 : (byte)0 };
+        }
+
+        public static byte[] BuildEplpCommandAck(byte state, byte option)
+        {
+            return new byte[] { 0x01, state, option };
         }
     }
 
-    public struct StageMonster
-    {
-        public int ListIndex;
-        public ushort MonsterUniqueId;
-        public int MonsterIndex;
-        public byte MonsterLevel;
-        public byte MonsterType;    // 0=普通, 5=APC
-        public byte IsBoxMonster;
-        public byte BoxIndex;
-    }
-
-    public struct StageTowerItem
-    {
-        public int SourceListIndex;
-        public ushort SourceMonsterUniqueId;
-        public ushort ItemUniqueId;
-        public int ItemId;
-        public int DropRate;
-        public int StackCount;
-    }
 }

@@ -1,8 +1,11 @@
 using DfoServer.Game.Inventory;
+using DfoServer.Game.Dungeon;
+using DfoServer.Game.Mercenary;
 using DfoServer.Game.Quests;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Network.Builders;
 using DfoServer.Network.Handlers.Dungeon;
+using DfoServer.Network.Parsers.Dungeon;
 using System;
 using System.Threading.Tasks;
 
@@ -17,6 +20,8 @@ namespace DfoServer.Network.Handlers
         private readonly DungeonMapHandler _map;
         private readonly DungeonCombatHandler _combat;
         private readonly DungeonSettlementHandler _settlement;
+        private readonly TournamentDungeonCoordinator _tournament;
+        private readonly BloodAltarDungeonCoordinator _bloodAltar;
         private readonly DungeonTutorialHandler _tutorial;
 
         public DungeonHandler(
@@ -29,7 +34,41 @@ namespace DfoServer.Network.Handlers
             Game.Party.PartyManager partyManager = null,
             Game.Session.ISessionDirectory sessionDirectory = null,
             Game.Quests.QuestDropService questDropService = null,
-            Game.Accounts.AccountExperienceProgressService accountExperience = null)
+            Game.Accounts.AccountExperienceProgressService accountExperience = null,
+            IMercenaryRestrictionService mercenaryRestrictions = null)
+            : this(
+                null,
+                reviveCoinService,
+                characterRepository,
+                selectCharacterDataSource,
+                rentalTimeProvider,
+                connectionString,
+                inventoryRefresh,
+                partyManager,
+                sessionDirectory,
+                questDropService,
+                accountExperience,
+                mercenaryRestrictions,
+                null,
+                null)
+        {
+        }
+
+        internal DungeonHandler(
+            Game.Dungeon.DungeonPersistentEffectApplicationService persistentEffects,
+            Game.ReviveCoin.ReviveCoinService reviveCoinService,
+            Game.Characters.SqliteCharacterRepository characterRepository,
+            SqliteSelectCharacterDataSource selectCharacterDataSource,
+            IRentalTimeProvider rentalTimeProvider,
+            string connectionString,
+            InventoryRefreshSender inventoryRefresh,
+            Game.Party.PartyManager partyManager = null,
+            Game.Session.ISessionDirectory sessionDirectory = null,
+            Game.Quests.QuestDropService questDropService = null,
+            Game.Accounts.AccountExperienceProgressService accountExperience = null,
+            IMercenaryRestrictionService mercenaryRestrictions = null,
+            Game.Dungeon.DungeonInstanceRegistry instanceRegistry = null,
+            Game.Raid.RaidManager raidManager = null)
         {
             _services = new DungeonSharedServices(
                 reviveCoinService,
@@ -41,16 +80,37 @@ namespace DfoServer.Network.Handlers
                 partyManager,
                 sessionDirectory,
                 questDropService,
-                accountExperience);
+                accountExperience,
+                mercenaryRestrictions,
+                persistentEffects,
+                instanceRegistry,
+                raidManager);
             _map = new DungeonMapHandler(_services);
             _entry = new DungeonEntryHandler(_services, _map);
             _settlement = new DungeonSettlementHandler(_services, _entry);
-            _combat = new DungeonCombatHandler(_services, _settlement);
+            _tournament = new TournamentDungeonCoordinator(
+                _services,
+                _settlement);
+            _bloodAltar = new BloodAltarDungeonCoordinator(
+                _services,
+                _settlement);
+            _combat = new DungeonCombatHandler(
+                _services,
+                _settlement,
+                _tournament,
+                _bloodAltar);
+            _bloodAltar.ConfigureKillProcessor(
+                _combat.ProcessMechanismKillAsync);
+            _settlement.ConfigureBloodAltarPresentation(
+                _bloodAltar.OnParticipantClearedAsync,
+                _bloodAltar.TryHandleEplpCommandAsync);
             _tutorial = new DungeonTutorialHandler(_services, _settlement);
         }
 
-        public static Task ResetDungeonStateAsync(EnhancedClientSession session)
-            => Dungeon.DungeonRunLifecycle.EndRunToTownAsync(session);
+        public static async Task ResetDungeonStateAsync(EnhancedClientSession session)
+            => await Dungeon.DungeonRunLifecycle.EndRunAsync(
+                session,
+                Game.Dungeon.DungeonRunEndReason.ReturnToTown);
 
         public Task Handle_ENUM_CMDPACKET_ENTER_SELECT_DUNGEON(EnhancedClientSession session, GamePacketHeader header, byte[] body)
             => _entry.HandleEnterSelectDungeon(session, header, body);
@@ -77,6 +137,9 @@ namespace DfoServer.Network.Handlers
             => _combat.HandleDeathRespawn(session, header, body);
 
         public Task Handle_ENUM_CMDPACKET_USE_COIN(EnhancedClientSession session, GamePacketHeader header, byte[] body)
+            => _combat.HandleUseCoin(session, header, body);
+
+        public Task<bool> HandleUseCoinWithResultAsync(EnhancedClientSession session, GamePacketHeader header, byte[] body)
             => _combat.HandleUseCoin(session, header, body);
 
         public Task Handle_ENUM_CMDPACKET_GET_ITEM(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -121,33 +184,62 @@ namespace DfoServer.Network.Handlers
         public Task<bool> TryHandleDeathTowerMoveItem(EnhancedClientSession session, GamePacketHeader header, byte[] body)
             => _services.DeathTower.TryHandleMoveItem(session, header, body);
 
-        public Task Handle_SPECIAL_SUMMON_MONSTER(EnhancedClientSession session, GamePacketHeader header, byte[] body)
-            => Dungeon.SpecialDungeonNotifier.HandleBossSummonRequestAsync(session, header, body);
+        public Task<bool> TryHandleDeathTowerSortItem(EnhancedClientSession session, GamePacketHeader header, byte[] body)
+            => _services.DeathTower.TryHandleSortItem(session, header, body);
 
-        public Task Handle_SPECIAL_TIMER_MODIFY_INFO(EnhancedClientSession session, GamePacketHeader header, byte[] body)
-            => Dungeon.SpecialDungeonNotifier.HandleGentInfiltrateTimerModifyInfoAsync(session, header, body);
+        public Task<bool> TryHandleDeathTowerDeleteItem(EnhancedClientSession session, GamePacketHeader header, byte[] body)
+            => _services.DeathTower.TryHandleDeleteItem(session, header, body);
 
-        public Task Handle_SPECIAL_SEA_CHASE_RESULT(EnhancedClientSession session, GamePacketHeader header, byte[] body)
-            => Dungeon.SpecialDungeonNotifier.HandleSeaChaseMiniGameResultAsync(session, header, body);
-
-        public Task Handle_SPECIAL_SEA_CHASE_OBSERVE(EnhancedClientSession session, GamePacketHeader header, byte[] body)
-            => Dungeon.SpecialDungeonNotifier.ObserveSeaChasePacketAsync(session, header, body);
-
-        public Task Handle_BREAK_TRAP_RESULT(
+        public Task HandleDungeonMechanismCommand(
             EnhancedClientSession session,
             GamePacketHeader header,
             byte[] body)
-            => Dungeon.TimeSpiralDungeonCoordinator.HandleBreakTrapResultAsync(
+        {
+            if (!DungeonCommandParser.TryParse(
+                    header.type,
+                    body,
+                    out var command,
+                    out var error))
+            {
+                FileLogger.Log(
+                    $"[DungeonCommand] parse rejected type=0x{header.type:X4} " +
+                    $"cid={session?.Player?.CharacterId ?? 0} error={error} " +
+                    $"body={(body == null ? "null" : BitConverter.ToString(body))}");
+                return Task.CompletedTask;
+            }
+
+            return Dungeon.DungeonMechanismCoordinator.OnCommandReceivedAsync(
                 session,
-                header,
-                body);
+                command,
+                _services.Drops,
+                _tournament,
+                _bloodAltar);
+        }
 
         internal Task HandleQuestSetTriggerResultAsync(
             EnhancedClientSession session,
-            QuestSetTriggerResult result)
+            QuestSetTriggerResult result,
+            DungeonEventEnvelope sourceEvent)
             => _settlement.TryClearQuestNpcDungeonAsync(
                 session,
-                result);
+                result,
+                sourceEvent);
+
+        internal async Task RecoverDungeonParticipantEffectsAsync(
+            EnhancedClientSession session)
+        {
+            await _combat.RecoverParticipantEffectsAsync(session);
+            await _settlement.RecoverParticipantClearEffectsAsync(session);
+            await Dungeon.SpecialDungeonNotifier
+                .RecoverPendingEffectPlansAsync(session);
+            await _services.DeathTower.RecoverSettlementAsync(session);
+            await _settlement.RecoverPendingSettlementPresentationAsync(session);
+            await _bloodAltar.RecoverAsync(session);
+            await _tournament.RecoverAsync(session);
+            _services.CardRewards.RecoverTimer(session);
+            _combat.RecoverDeathRespawnTimer(session);
+            Dungeon.DungeonMechanismTimerCoordinator.Recover(session);
+        }
 
         public Task HandleDungeonSceneUniqueIdReport(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {

@@ -1,31 +1,34 @@
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Quests;
+using DfoServer.GameWorld;
 using DfoServer.Infrastructure;
 using PvfLib;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text.RegularExpressions;
 using DungeonData = DfoServer.GameWorld.Dungeon;
 
 namespace DfoServer.Network.Handlers.Dungeon
 {
     internal static class SpecialDungeonRunCoordinator
     {
-        internal static bool IsBossEntranceSummonKind(SpecialDungeonKind kind)
-            => kind == SpecialDungeonKind.MeltdownHelpus
-                || kind == SpecialDungeonKind.StationEscape;
-
         internal static void InitializeRuntime(
             EnhancedClientSession session,
-            int dungeonId,
+            DungeonRun run,
             string source)
         {
-            var run = session?.Player?.CurrentRun;
-            if (run == null)
+            if (run == null
+                || session?.Player == null
+                || !session.Player.IsCurrentDungeonRun(run.CaptureIdentity()))
                 return;
 
-            run.SpecialDungeon = SpecialDungeonModuleConfig.CreateRuntime(dungeonId);
+            var dungeonId = run.DungeonId;
+            run.SpecialDungeon =
+                SpecialDungeonDefinitionCatalog.TryGet(
+                    dungeonId,
+                    out var definition)
+                    ? new SpecialDungeonRuntime(definition)
+                    : null;
             var special = run.SpecialDungeon;
             if (special == null)
                 return;
@@ -60,32 +63,44 @@ namespace DfoServer.Network.Handlers.Dungeon
             run.IgnoreDefaultDungeonClear =
                 dungeonFile.IgnoreDefaultDungeonClear
                 || TimeSpiralDungeonCoordinator.IsDungeon(run.DungeonId);
-            run.MeltdownHelpusHostages.Clear();
+            run.BossEntranceConditionTargets.Clear();
+            run.BossEntranceConditionalSummonCodes.Clear();
+            run.BossEntranceConditionComplete = false;
+            run.ConditionalBossSpawned = false;
+            run.ConditionalBossCode = 0;
             run.SpecialMinimapIconGroups = null;
 
-            var special = run.SpecialDungeon;
-            if (special == null)
-                return;
-
-            if (IsBossEntranceSummonKind(special.Kind))
+            var targetCodes = DungeonConditionDefinitionParser.ParseMonsterCodes(
+                dungeonFile.BossRoomEntranceCondition,
+                "[hunt monster]");
+            var summonCodes = DungeonConditionDefinitionParser.ParseMonsterCodes(
+                dungeonFile.BossRoomEntranceCondition,
+                "[summon monster]");
+            if (targetCodes.Count > 0 && summonCodes.Count > 0)
             {
-                run.MeltdownHelpusHostages = BuildBossEntranceAssignments(
+                run.BossEntranceConditionTargets = BuildBossEntranceConditionTargets(
                     run.DungeonId,
                     run.MazeIndex,
                     maze,
                     bossPos,
-                    dungeonFile);
-                run.SpecialMinimapIconGroups =
-                    BuildMinimapIconGroupsFromAssignments(run.MeltdownHelpusHostages);
+                    targetCodes);
+                if (run.BossEntranceConditionTargets.Count > 0)
+                {
+                    run.BossEntranceConditionalSummonCodes.AddRange(summonCodes);
+                    run.SpecialMinimapIconGroups =
+                        BuildMinimapIconGroupsFromTargets(
+                            run.BossEntranceConditionTargets);
+                }
             }
-            else if (special.Kind == SpecialDungeonKind.GentInfiltrate)
+
+            var special = run.SpecialDungeon;
+            if (special?.Kind == SpecialDungeonKind.GentInfiltrate)
             {
-                special.Config.TimerSecondsByDungeonId.TryGetValue(
-                    run.DungeonId,
-                    out var timerSeconds);
                 special.ConfigureGentInfiltrateBossEntrance(
-                    dungeonFile.BossRoomEntranceCondition,
-                    timerSeconds);
+                    SpecialDungeonDefinitionCatalog
+                        .ParseGentInfiltrateTowerRequirements(
+                            dungeonFile.BossRoomEntranceCondition),
+                    special.Definition.TimerSeconds);
                 run.SpecialMinimapIconGroups = BuildGentTowerIconGroups(
                     run.DungeonId,
                     run.MazeIndex,
@@ -94,23 +109,44 @@ namespace DfoServer.Network.Handlers.Dungeon
                     special);
             }
 
-            if (special.Kind == SpecialDungeonKind.TimeCrack)
-            {
-                run.SelectedBossMapId = ResolveSelectedBossMapId(
+            // Keep the existing quest/random choice as a fallback. When the PVF
+            // candidate MAP greed masks differ by entrance, the shared instance
+            // runtime commits the matching pool when that entrance is traversed.
+            var fallbackBossMapId = ResolveSelectedBossMapId(
+                run.DungeonId,
+                run.MazeIndex,
+                maze,
+                bossPos,
+                activeQuests,
+                run.Difficulty);
+            run.SelectedBossMapId = fallbackBossMapId;
+            var bossRouteDefinition =
+                DungeonBossRouteDefinitionProjector.Project(
                     run.DungeonId,
                     run.MazeIndex,
                     maze,
-                    bossPos,
-                    activeQuests);
+                    bossPos);
+            if (bossRouteDefinition != null
+                && fallbackBossMapId > 0
+                && bossRouteDefinition.ContainsMapId(fallbackBossMapId))
+            {
+                run.Instance.Mechanisms.TryAttachBossRoute(
+                    new DungeonBossRouteRuntime(
+                        bossRouteDefinition,
+                        fallbackBossMapId));
             }
 
             FileLogger.Log(
                 $"[SpecialDungeonModule] selection configured: " +
-                $"dungeon={run.DungeonId} maze={run.MazeIndex} kind={special.Kind} " +
+                $"dungeon={run.DungeonId} maze={run.MazeIndex} " +
+                $"kind={special?.Kind.ToString() ?? "none"} " +
                 $"ignoreDefault={run.IgnoreDefaultDungeonClear} " +
-                $"conditionTargets={run.MeltdownHelpusHostages.Count} " +
+                $"conditionTargets={run.BossEntranceConditionTargets.Count} " +
+                $"conditionalBosses={run.BossEntranceConditionalSummonCodes.Count} " +
                 $"iconGroups={run.SpecialMinimapIconGroups?.Count ?? 0} " +
-                $"timer={special.GentInfiltrateTimerSeconds}");
+                $"timer={special?.GentInfiltrateTimerSeconds ?? 0} " +
+                $"bossRouteCount={run.Instance.Mechanisms.BossRoute?.Definition.Routes.Count ?? 0} " +
+                $"bossFallback={fallbackBossMapId}");
         }
 
         internal static void CloneSelectionState(DungeonRun source, DungeonRun target)
@@ -122,52 +158,13 @@ namespace DfoServer.Network.Handlers.Dungeon
             target.IgnoreDefaultDungeonClear = source.IgnoreDefaultDungeonClear;
             target.SpecialMinimapIconGroups = CloneMinimapIconGroups(
                 source.SpecialMinimapIconGroups);
-            target.MeltdownHelpusHostages = CloneAssignments(
-                source.MeltdownHelpusHostages);
+            target.BossEntranceConditionTargets = CloneBossEntranceConditionTargets(
+                source.BossEntranceConditionTargets);
+            target.BossEntranceConditionalSummonCodes =
+                source.BossEntranceConditionalSummonCodes == null
+                    ? new List<int>()
+                    : new List<int>(source.BossEntranceConditionalSummonCodes);
             target.SelectedBossMapId = source.SelectedBossMapId;
-        }
-
-        internal static IReadOnlyList<IReadOnlyList<(byte, byte)>> ResolveMinimapIconGroups(
-            DungeonRun run,
-            int dungeonId,
-            int mazeIndex)
-        {
-            if (run?.SpecialMinimapIconGroups != null
-                && run.SpecialMinimapIconGroups.Count > 0)
-            {
-                return run.SpecialMinimapIconGroups;
-            }
-
-            MazeInfo maze;
-            try
-            {
-                maze = DungeonData.GetDungeonMaze(dungeonId, mazeIndex);
-            }
-            catch
-            {
-                return null;
-            }
-
-            if (maze?.RidableScript == null
-                || maze.RidableScript.MinimapIcon <= 0
-                || run?.RidableObjects == null
-                || run.RidableObjects.Count == 0)
-            {
-                return null;
-            }
-
-            var points = new List<(byte, byte)>();
-            var seen = new HashSet<int>();
-            foreach (var obj in run.RidableObjects)
-            {
-                var key = (obj.MapX << 8) | obj.MapY;
-                if (seen.Add(key))
-                    points.Add((obj.MapX, obj.MapY));
-            }
-
-            return points.Count > 0
-                ? new List<IReadOnlyList<(byte, byte)>> { points }
-                : null;
         }
 
         internal static int ResolveStartMapOverride(
@@ -177,7 +174,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             int requestedOverrideMapId)
         {
             if (requestedOverrideMapId > 0
-                || run?.SelectedBossMapId <= 0
+                || run == null
                 || run.BossMapPos == null
                 || run.BossMapPos.Length < 2
                 || nextX != run.BossMapPos[0]
@@ -186,18 +183,97 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return requestedOverrideMapId;
             }
 
+            var bossRoute = run.Instance?.Mechanisms.BossRoute;
+            if (bossRoute != null)
+            {
+                var selectedMapId = bossRoute.ResolveForStartMap(
+                    out var fallbackCommitted);
+                run.SelectedBossMapId = selectedMapId;
+                if (fallbackCommitted)
+                {
+                    FileLogger.Log(
+                        $"[SpecialDungeonModule] boss route fallback committed: " +
+                        $"instance={run.PartyDungeonInstanceId} dungeon={run.DungeonId} " +
+                        $"boss=({nextX},{nextY}) map={selectedMapId}");
+                }
+                return selectedMapId;
+            }
+
+            if (run.SelectedBossMapId <= 0)
+                return requestedOverrideMapId;
             return run.SelectedBossMapId;
+        }
+
+        internal static bool TryApplyBossRouteOverride(
+            DungeonRun run,
+            DungeonRoomPoint moveTarget,
+            ref int overrideMapId)
+        {
+            var bossRoute = run?.Instance?.Mechanisms.BossRoute;
+            if (bossRoute == null || overrideMapId > 0)
+                return false;
+
+            if (!bossRoute.TrySelectForMove(
+                    run.RoomKey.X,
+                    run.RoomKey.Y,
+                    moveTarget.X,
+                    moveTarget.Y,
+                    ServerRandom.Next,
+                    out var selectedMapId,
+                    out var transitioned))
+            {
+                return false;
+            }
+
+            run.SelectedBossMapId = selectedMapId;
+            overrideMapId = selectedMapId;
+            if (transitioned)
+            {
+                FileLogger.Log(
+                    $"[SpecialDungeonModule] boss route committed: " +
+                    $"instance={run.PartyDungeonInstanceId} dungeon={run.DungeonId} " +
+                    $"source=({run.RoomKey.X},{run.RoomKey.Y}) " +
+                    $"boss=({moveTarget.X},{moveTarget.Y}) " +
+                    $"direction={bossRoute.SelectedDirection} map={selectedMapId}");
+            }
+            return true;
+        }
+
+        internal static void CopyBossRouteStateForPartyMove(
+            DungeonRun leaderRun,
+            DungeonRun memberRun)
+        {
+            if (leaderRun == null
+                || memberRun == null
+                || leaderRun.PartyDungeonInstanceId
+                    != memberRun.PartyDungeonInstanceId)
+            {
+                return;
+            }
+
+            var selectedMapId = leaderRun.Instance.Mechanisms.BossRoute?.SelectedMapId
+                ?? leaderRun.SelectedBossMapId;
+            if (selectedMapId > 0)
+                memberRun.SelectedBossMapId = selectedMapId;
         }
 
         internal static void AppendStartMapActors(
             EnhancedClientSession session,
             DungeonData.MazeSumInfo maze)
+            => AppendStartMapActors(
+                session,
+                session?.Player?.CurrentRun,
+                maze);
+
+        internal static void AppendStartMapActors(
+            EnhancedClientSession session,
+            DungeonRun run,
+            DungeonData.MazeSumInfo maze)
         {
-            var run = session?.Player?.CurrentRun;
-            var special = run?.SpecialDungeon;
-            if (run == null
-                || special == null
-                || !IsBossEntranceSummonKind(special.Kind)
+            if (session?.Player == null
+                || run == null
+                || !session.Player.IsCurrentDungeonRun(run.CaptureIdentity())
+                || !run.HasBossEntranceConditionalSummon
                 || maze.Monsters == null)
             {
                 return;
@@ -211,10 +287,22 @@ namespace DfoServer.Network.Handlers.Dungeon
             EnhancedClientSession session,
             DungeonRoomPoint moveTarget,
             ref int overrideMapId)
+            => TryApplyGentWarpOverride(
+                session,
+                session?.Player?.CurrentRun,
+                moveTarget,
+                ref overrideMapId);
+
+        internal static bool TryApplyGentWarpOverride(
+            EnhancedClientSession session,
+            DungeonRun run,
+            DungeonRoomPoint moveTarget,
+            ref int overrideMapId)
         {
-            var run = session?.Player?.CurrentRun;
             var special = run?.SpecialDungeon;
-            if (run == null
+            if (session?.Player == null
+                || run == null
+                || !session.Player.IsCurrentDungeonRun(run.CaptureIdentity())
                 || special == null
                 || special.Kind != SpecialDungeonKind.GentInfiltrate
                 || !special.GentInfiltrateConditionComplete)
@@ -247,29 +335,13 @@ namespace DfoServer.Network.Handlers.Dungeon
             return true;
         }
 
-        internal static List<int> GetBossEntranceSummonCodes(int dungeonId)
-        {
-            try
-            {
-                return ParseConditionMonsterCodes(
-                    DungeonData.GetDungeonFile(dungeonId).BossRoomEntranceCondition,
-                    "[summon monster]");
-            }
-            catch (Exception ex)
-            {
-                FileLogger.Log(
-                    $"[SpecialDungeonModule] boss summon config load failed: " +
-                    $"dungeon={dungeonId} error={ex.Message}");
-                return new List<int>();
-            }
-        }
-
         internal static int ResolveSelectedBossMapId(
             int dungeonId,
             int mazeIndex,
             MazeInfo maze,
             int[] bossPos,
-            IReadOnlyList<ActiveQuest> activeQuests)
+            IReadOnlyList<ActiveQuest> activeQuests,
+            int difficulty = -1)
         {
             if (bossPos == null
                 || bossPos.Length < 2
@@ -285,7 +357,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                 dungeonId,
                 maze,
                 bossPos,
-                activeQuests);
+                activeQuests,
+                difficulty);
             if (questMapId > 0)
                 return questMapId;
 
@@ -310,7 +383,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             int dungeonId,
             MazeInfo maze,
             int[] bossPos,
-            IReadOnlyList<ActiveQuest> activeQuests)
+            IReadOnlyList<ActiveQuest> activeQuests,
+            int difficulty = -1)
         {
             if (bossPos == null
                 || bossPos.Length < 2
@@ -329,23 +403,19 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return -1;
 
             var matchesByMap =
-                new Dictionary<int, List<(ActiveQuest Quest, GameWorld.HuntMonsterQuestTarget Target)>>();
+                new Dictionary<int, List<(ActiveQuest Quest, GameWorld.DungeonQuestActorTarget Target)>>();
             foreach (var activeQuest in activeQuests)
             {
                 if (activeQuest == null || activeQuest.TriggerValue == 0)
                     continue;
 
                 foreach (var target in
-                    GameWorld.QuestData.GetHuntMonsterTargets(activeQuest.QuestId))
+                    GameWorld.QuestData.GetUnfinishedDungeonActorTargets(
+                        activeQuest.QuestId,
+                        activeQuest.TriggerValue,
+                        dungeonId,
+                        difficulty))
                 {
-                    if (target.DungeonId != dungeonId
-                        || GameWorld.QuestData.GetTriggerChannel(
-                            activeQuest.TriggerValue,
-                            target.ChannelIndex) <= 0)
-                    {
-                        continue;
-                    }
-
                     foreach (var candidateMapId in candidateMapIds)
                     {
                         if (target.MapId > 0
@@ -356,7 +426,7 @@ namespace DfoServer.Network.Handlers.Dungeon
 
                         if (!GameWorld.DungeonMapResolver.MapContainsMonsterCode(
                                 candidateMapId,
-                                target.MonsterCode))
+                                target.ActorCode))
                         {
                             continue;
                         }
@@ -366,7 +436,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                             out var matches))
                         {
                             matches =
-                                new List<(ActiveQuest, GameWorld.HuntMonsterQuestTarget)>();
+                                new List<(ActiveQuest, GameWorld.DungeonQuestActorTarget)>();
                             matchesByMap[candidateMapId] = matches;
                         }
                         matches.Add((activeQuest, target));
@@ -403,10 +473,14 @@ namespace DfoServer.Network.Handlers.Dungeon
             var selectedMapId = bestMapIds.Count == 1
                 ? bestMapIds[0]
                 : bestMapIds[ServerRandom.Next(bestMapIds.Count)];
+            var sourceSummary = string.Join(",", matchesByMap[selectedMapId]
+                .Select(match =>
+                    $"{match.Quest.QuestId}:{match.Target.Source}:{match.Target.ActorCode}"));
             FileLogger.Log(
-                $"[SpecialDungeonModule] TIME_CRACK quest boss map: " +
+                $"[SpecialDungeonModule] quest-bound boss map: " +
                 $"dungeon={dungeonId} map={selectedMapId} " +
-                $"matches={matchesByMap[selectedMapId].Count}");
+                $"matches={matchesByMap[selectedMapId].Count} " +
+                $"sources={sourceSummary}");
             return selectedMapId;
         }
 
@@ -415,14 +489,14 @@ namespace DfoServer.Network.Handlers.Dungeon
             DungeonData.MazeSumInfo maze)
         {
             var codes = new List<int>();
-            foreach (var assignment in run.MeltdownHelpusHostages)
+            foreach (var target in run.BossEntranceConditionTargets)
             {
-                if (assignment != null
-                    && !assignment.Rescued
-                    && assignment.X == maze.X
-                    && assignment.Y == maze.Y)
+                if (target != null
+                    && !target.Completed
+                    && target.X == maze.X
+                    && target.Y == maze.Y)
                 {
-                    codes.Add(assignment.MonsterCode);
+                    codes.Add(target.MonsterCode);
                 }
             }
 
@@ -438,7 +512,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             maze.Monsters.AddRange(actors);
             FileLogger.Log(
                 $"[SpecialDungeonModule] condition actors added: " +
-                $"dungeon={run.DungeonId} kind={run.SpecialDungeon.Kind} " +
+                $"dungeon={run.DungeonId} mechanism=boss-entrance-condition " +
                 $"room=({maze.X},{maze.Y}) map={maze.Index} " +
                 $"codes={string.Join(",", codes)} count={actors.Count}");
         }
@@ -447,7 +521,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             DungeonRun run,
             DungeonData.MazeSumInfo maze)
         {
-            var bossCodes = GetBossEntranceSummonCodes(run.DungeonId);
+            var bossCodes = run.BossEntranceConditionalSummonCodes;
             if (bossCodes.Count == 0)
                 return;
 
@@ -474,27 +548,23 @@ namespace DfoServer.Network.Handlers.Dungeon
             {
                 FileLogger.Log(
                     $"[SpecialDungeonModule] hidden boss templates added: " +
-                    $"dungeon={run.DungeonId} kind={run.SpecialDungeon.Kind} " +
+                    $"dungeon={run.DungeonId} mechanism=boss-entrance-condition " +
                     $"room=({maze.X},{maze.Y}) map={maze.Index} count={added}");
             }
         }
 
-        private static List<MeltdownHelpusHostageAssignment> BuildBossEntranceAssignments(
+        private static List<BossEntranceConditionTargetState> BuildBossEntranceConditionTargets(
             int dungeonId,
             int mazeIndex,
             MazeInfo maze,
             int[] bossPos,
-            DungeonFile dungeonFile)
+            IReadOnlyCollection<int> monsterCodes)
         {
-            var assignments = new List<MeltdownHelpusHostageAssignment>();
-            if (maze?.MapSpecifications == null || dungeonFile == null)
-                return assignments;
-
-            var monsterCodes = ParseConditionMonsterCodes(
-                dungeonFile.BossRoomEntranceCondition,
-                "[hunt monster]");
-            if (monsterCodes.Count == 0)
-                return assignments;
+            var targets = new List<BossEntranceConditionTargetState>();
+            if (maze?.MapSpecifications == null
+                || monsterCodes == null
+                || monsterCodes.Count == 0)
+                return targets;
 
             var candidates = new List<(byte X, byte Y, int MapId)>();
             foreach (var spec in maze.MapSpecifications)
@@ -511,14 +581,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                         dungeonId,
                         spec.X,
                         spec.Y,
-                        monsterCodes).Count > 0)
+                        monsterCodes.ToList()).Count > 0)
                 {
                     candidates.Add(((byte)spec.X, (byte)spec.Y, spec.Index));
                 }
             }
 
             if (candidates.Count == 0)
-                return assignments;
+                return targets;
 
             var available = new List<(byte X, byte Y, int MapId)>(candidates);
             var logParts = new List<string>();
@@ -530,7 +600,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 var pick = ServerRandom.Next(available.Count);
                 var point = available[pick];
                 available.RemoveAt(pick);
-                assignments.Add(new MeltdownHelpusHostageAssignment
+                targets.Add(new BossEntranceConditionTargetState
                 {
                     MonsterCode = monsterCode,
                     X = point.X,
@@ -543,7 +613,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 $"[SpecialDungeonModule] condition assignments: " +
                 $"dungeon={dungeonId} maze={mazeIndex} " +
                 $"assignments={string.Join(",", logParts)}");
-            return assignments;
+            return targets;
         }
 
         private static IReadOnlyList<IReadOnlyList<(byte, byte)>>
@@ -591,17 +661,17 @@ namespace DfoServer.Network.Handlers.Dungeon
         }
 
         private static IReadOnlyList<IReadOnlyList<(byte, byte)>>
-            BuildMinimapIconGroupsFromAssignments(
-                IReadOnlyList<MeltdownHelpusHostageAssignment> assignments)
+            BuildMinimapIconGroupsFromTargets(
+                IReadOnlyList<BossEntranceConditionTargetState> targets)
         {
-            if (assignments == null || assignments.Count == 0)
+            if (targets == null || targets.Count == 0)
                 return null;
 
             var points = new List<(byte, byte)>();
-            foreach (var assignment in assignments)
+            foreach (var target in targets)
             {
-                if (assignment != null)
-                    points.Add((assignment.X, assignment.Y));
+                if (target != null)
+                    points.Add((target.X, target.Y));
             }
 
             return points.Count > 0
@@ -624,10 +694,11 @@ namespace DfoServer.Network.Handlers.Dungeon
             return result;
         }
 
-        private static List<MeltdownHelpusHostageAssignment> CloneAssignments(
-            IReadOnlyList<MeltdownHelpusHostageAssignment> source)
+        private static List<BossEntranceConditionTargetState>
+            CloneBossEntranceConditionTargets(
+                IReadOnlyList<BossEntranceConditionTargetState> source)
         {
-            var result = new List<MeltdownHelpusHostageAssignment>();
+            var result = new List<BossEntranceConditionTargetState>();
             if (source == null)
                 return result;
 
@@ -636,55 +707,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                 if (item == null)
                     continue;
 
-                result.Add(new MeltdownHelpusHostageAssignment
+                result.Add(new BossEntranceConditionTargetState
                 {
                     MonsterCode = item.MonsterCode,
                     X = item.X,
                     Y = item.Y,
-                    Rescued = item.Rescued,
+                    Completed = item.Completed,
                 });
             }
-            return result;
-        }
-
-        private static List<int> ParseConditionMonsterCodes(
-            string condition,
-            string tag)
-        {
-            var result = new List<int>();
-            var tokens = Tokenize(condition);
-            for (var i = 0; i < tokens.Count; i++)
-            {
-                if (!string.Equals(tokens[i], tag, StringComparison.OrdinalIgnoreCase)
-                    || i + 1 >= tokens.Count
-                    || !int.TryParse(tokens[i + 1], out var count)
-                    || count <= 0)
-                {
-                    continue;
-                }
-
-                var pos = i + 2;
-                for (var n = 0; n < count && pos < tokens.Count; n++, pos += 3)
-                {
-                    if (int.TryParse(tokens[pos], out var monsterCode)
-                        && monsterCode > 0)
-                    {
-                        result.Add(monsterCode);
-                    }
-                }
-                break;
-            }
-            return result;
-        }
-
-        private static List<string> Tokenize(string value)
-        {
-            var result = new List<string>();
-            if (string.IsNullOrWhiteSpace(value))
-                return result;
-
-            foreach (Match match in Regex.Matches(value, "`([^`]*)`|\\S+"))
-                result.Add(match.Groups[1].Success ? match.Groups[1].Value : match.Value);
             return result;
         }
 

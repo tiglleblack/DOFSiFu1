@@ -1,8 +1,10 @@
 using DfoServer.Game.Accounts;
 using DfoServer.Game.Appearance;
+using DfoServer.Game.DailyReset;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.KnightShield;
+using DfoServer.Game.Mercenary;
 using DfoServer.Game.Names;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.GameWorld;
@@ -24,6 +26,10 @@ namespace DfoServer.Network.Handlers
         private readonly HonorLevelSyncService _honorLevel;
         private readonly Game.Session.ISessionDirectory _sessions;   // 他人外观 PULL: 按 uid 找目标在线会话; 可空(上游注册表)
         private readonly GrowthCapsuleSyncService _growthCapsule;
+        private readonly IMercenaryRestrictionService _mercenaryRestrictions;
+        private readonly Game.Dungeon.DungeonPersistentEffectApplicationService
+            _dungeonPersistentEffects;
+        private readonly Game.Dungeon.DungeonInstanceRegistry _dungeonInstances;
 
         public string ProtocolName => "GameProtocol";
 
@@ -31,7 +37,28 @@ namespace DfoServer.Network.Handlers
             ISelectCharacterDataSource selectCharacterDataSource,
             ICharacterRepository characterRepository,
             GetUserInfoTemplate getUserInfoTemplate,
-            Game.Session.ISessionDirectory sessions = null)
+            Game.Session.ISessionDirectory sessions = null,
+            IMercenaryRestrictionService mercenaryRestrictions = null)
+            : this(
+                null,
+                selectCharacterDataSource,
+                characterRepository,
+                getUserInfoTemplate,
+                sessions,
+                null,
+                mercenaryRestrictions)
+        {
+        }
+
+        internal CharacterSelectHandler(
+            Game.Dungeon.DungeonPersistentEffectApplicationService
+                dungeonPersistentEffects,
+            ISelectCharacterDataSource selectCharacterDataSource,
+            ICharacterRepository characterRepository,
+            GetUserInfoTemplate getUserInfoTemplate,
+            Game.Session.ISessionDirectory sessions = null,
+            Game.Dungeon.DungeonInstanceRegistry dungeonInstances = null,
+            IMercenaryRestrictionService mercenaryRestrictions = null)
         {
             _selectCharacterDataSource = selectCharacterDataSource ?? throw new ArgumentNullException(nameof(selectCharacterDataSource));
             _characterRepository = characterRepository ?? throw new ArgumentNullException(nameof(characterRepository));
@@ -39,15 +66,87 @@ namespace DfoServer.Network.Handlers
             _honorLevel = new HonorLevelSyncService(_characterRepository);
             _sessions = sessions;
             _growthCapsule = new GrowthCapsuleSyncService(_characterRepository);
+            _mercenaryRestrictions = mercenaryRestrictions;
+            _dungeonPersistentEffects = dungeonPersistentEffects;
+            _dungeonInstances = dungeonInstances;
         }
 
         // 按 UserId 找在线会话(他人外观拉取用)。
-        private EnhancedClientSession FindOnlineByUserId(ushort uid)
+        internal static EnhancedClientSession FindInspectableOnlineByUserId(
+            Game.Session.ISessionDirectory sessions,
+            EnhancedClientSession requester,
+            ushort uid)
         {
-            if (_sessions == null) return null;
-            foreach (var s in _sessions.GetAllGameSessions())
-                if (s?.Player != null && s.Player.CharacterId > 0 && s.Player.UserId == uid)
-                    return s;
+            if (sessions == null || requester == null)
+                return null;
+
+            EnhancedClientSession match = null;
+            foreach (var s in sessions.GetAllGameSessions())
+            {
+                if (s?.Player != null
+                    && s.Player.CharacterId > 0
+                    && s.Player.UserId == uid
+                    && PartyHandler.IsSameGameChannel(requester, s))
+                {
+                    // UserId is only 16 bits on the wire. Do not disclose an
+                    // arbitrary player when two full character ids collide.
+                    if (match != null && !ReferenceEquals(match, s))
+                        return null;
+                    match = s;
+                }
+            }
+
+            return match;
+        }
+
+        private bool IsAuthorizedInspectRequester(
+            EnhancedClientSession requester)
+        {
+            var player = requester?.Player;
+            return _sessions != null
+                && requester.Account?.AccountId > 0
+                && player != null
+                && player.CharacterId > 0
+                && player.UserId != 0
+                && player.UserId == unchecked((ushort)player.CharacterId)
+                && _sessions.TryGet(player.CharacterId, out var current)
+                && ReferenceEquals(current, requester);
+        }
+
+        private bool IsCurrentInspectableTarget(
+            EnhancedClientSession requester,
+            EnhancedClientSession target,
+            ushort requestedUserId)
+        {
+            var player = target?.Player;
+            return _sessions != null
+                && target.Account?.AccountId > 0
+                && player != null
+                && player.CharacterId > 0
+                && player.UserId == requestedUserId
+                && player.UserId
+                    == unchecked((ushort)player.CharacterId)
+                && _sessions.TryGet(
+                    player.CharacterId,
+                    out var current)
+                && ReferenceEquals(current, target)
+                && PartyHandler.IsSameGameChannel(
+                    requester,
+                    target);
+        }
+        // Kept for the narrow directory self-test and callers that do not have a
+        // requester yet. Production inspect handlers use the channel-aware lookup.
+        internal static EnhancedClientSession FindOnlineByUserId(
+            Game.Session.ISessionDirectory sessions,
+            ushort uid)
+        {
+            if (sessions == null)
+                return null;
+            foreach (var session in sessions.GetAllGameSessions())
+                if (session?.Player != null
+                    && session.Player.CharacterId > 0
+                    && session.Player.UserId == uid)
+                    return session;
             return null;
         }
 
@@ -92,73 +191,81 @@ namespace DfoServer.Network.Handlers
                 InventoryPersistenceService.SaveDirty(lease);
         }
 
-        private void TryRegisterInventoryLease(
+        private InventoryLease TryRegisterInventoryLease(
             EnhancedClientSession session,
             CharacterRecord record,
             InventoryService inventory)
         {
             if (session == null || record == null || inventory == null)
-                return;
+                return null;
 
             try
             {
-                InventoryContext.Register(session.SessionId, record.CharacterId, inventory);
+                return InventoryContext.Register(session.SessionId, record.CharacterId, inventory);
             }
             catch (Exception ex)
             {
                 FileLogger.Log(
                     $"[{ProtocolName}] inventory lease register failed cid={record.CharacterId} aid={inventory.AccountId}: {ex}");
+                return null;
             }
         }
 
-        public async Task Handle_ENUM_CMDPACKET_SELECT_CHARACTER(EnhancedClientSession session, GamePacketHeader header, byte[] body)
+        internal async Task HandleResolvedSelectCharacterAsync(
+            EnhancedClientSession session,
+            CharacterRecord record,
+            int slot)
         {
+            GameChannelSpawn selectedSpawn = null;
             try
             {
                 // 换角色前丢弃上一个角色的副本局: PlayerContext 实例跨角色复用, 不丢会把
                 // 上个角色的副本状态带给下个角色。
-                Dungeon.DungeonRunLifecycle.EndRunOnTeardown(session, "select_character");
-
-                int slot = 0;
-                if (body != null && body.Length >= 2)
-                {
-                    slot = BitConverter.ToUInt16(body, 0);
-                }
-                else
-                {
-                    FileLogger.Log($"[{ProtocolName}] Select character body too short ({body?.Length ?? 0}B), defaulting slot=0");
-                }
-
-                CharacterRecord record = null;
-                if (session.Account != null)
-                {
-                    var list = _characterRepository.ListByAccount(session.Account.AccountId);
-                    if (list.Count == 0)
-                    {
-                        FileLogger.Log($"[{ProtocolName}] Select character: account_id={session.Account.AccountId} has 0 characters, falling back to seed character_id={_selectCharacterDataSource.GetSeedCharacterId()}");
-                    }
-                    else
-                    {
-                        if (slot < 0 || slot >= list.Count)
-                        {
-                            FileLogger.Log($"[{ProtocolName}] Select character slot={slot} out of range (count={list.Count}), clamping to 0");
-                            slot = 0;
-                        }
-                        record = list[slot];
-                    }
-                }
-                if (record == null)
-                {
-                    record = _characterRepository.GetById(_selectCharacterDataSource.GetSeedCharacterId());
-                }
+                Dungeon.DungeonRunLifecycle.EndRunOnTeardown(
+                    session,
+                    "select_character",
+                    _dungeonInstances);
 
                 if (record != null)
                 {
+                    if (_dungeonPersistentEffects != null)
+                    {
+                        var recovery = _dungeonPersistentEffects
+                            .RecoverCharacter(record.CharacterId);
+                        if (recovery.CommittedCount > 0)
+                        {
+                            record = _characterRepository.GetById(
+                                record.CharacterId) ?? record;
+                        }
+                        if (recovery.CommittedCount > 0
+                            || recovery.DeadLetterCount > 0
+                            || recovery.FailedCount > 0
+                            || recovery.HasRemaining)
+                        {
+                            FileLogger.Log(
+                                $"[{ProtocolName}] dungeon effect recovery: " +
+                                $"cid={record.CharacterId} " +
+                                $"committed={recovery.CommittedCount} " +
+                                $"dead={recovery.DeadLetterCount} " +
+                                $"failed={recovery.FailedCount} " +
+                                $"pages={recovery.PagesScanned} " +
+                                $"scanned={recovery.RecordsScanned} " +
+                                $"remaining={recovery.RemainingCount} " +
+                                $"pageLimit={recovery.ReachedPageLimit} " +
+                                $"timeLimit={recovery.ReachedTimeLimit}");
+                        }
+                    }
+
                     SaveExistingInventoryLeaseBeforeReload(session, record.CharacterId);
                     var inventory = TryLoadInventoryForLease(
                         record.CharacterId,
                         ResolveAccountId(session, record));
-                    session.Player.HydrateFrom(record);
+                    selectedSpawn = GameChannelSpawnPolicy.Resolve(
+                        session.ListenerPort,
+                        record.TownId);
+                    session.Player.HydrateFrom(
+                        record,
+                        selectedSpawn);
                     TryRegisterInventoryLease(session, record, inventory);
 
                     try
@@ -180,6 +287,14 @@ namespace DfoServer.Network.Handlers
                         {
                             _honorLevel.ApplyToSubtype0Tail(tail, session.Account.AccountId, null);
                         }
+                        if (GameNetworkConfig.IsRaidListener(session.ListenerPort))
+                        {
+                            tail = tail ?? new UserInfoMinimumTailSnapshot();
+                            tail.ChannelDisplayMode = 5;
+                            tail.ChannelType = GameNetworkConfig.ResolveLoginEnvironment(session.ListenerPort);
+                            tail.ChannelId = (ushort)GameNetworkConfig
+                                .ResolveGameChannel(session.ListenerPort).ChannelId;
+                        }
                         if (tail != null)
                         {
                             record.Subtype0Tail = tail;
@@ -199,14 +314,18 @@ namespace DfoServer.Network.Handlers
                     }
 
                     session.Player.AppearanceEntries = record.Appearance ?? Array.Empty<CharacterAppearanceEntry>();
-                    _characterRepository.UpdatePosition(
-                        session.Player.CharacterId,
-                        session.Player.CurTownId,
-                        session.Player.CurAreaId,
-                        session.Player.CurPosX,
-                        session.Player.CurPosY,
-                        session.Player.CurDirection,
-                        session.Player.CurAreaState);
+                    if (GameChannelSpawnPolicy.ShouldPersistPosition(
+                            session.ListenerPort))
+                    {
+                        _characterRepository.UpdatePosition(
+                            session.Player.CharacterId,
+                            session.Player.CurTownId,
+                            session.Player.CurAreaId,
+                            session.Player.CurPosX,
+                            session.Player.CurPosY,
+                            session.Player.CurDirection,
+                            session.Player.CurAreaState);
+                    }
                     FileLogger.Log($"[{ProtocolName}] Select character hydrated session {session.SessionId} slot={slot} <- character_id={record.CharacterId} name={record.DisplayName} town={session.Player.CurTownId} area={session.Player.CurAreaId} pos=({session.Player.CurPosX},{session.Player.CurPosY})");
                 }
                 else
@@ -233,8 +352,76 @@ namespace DfoServer.Network.Handlers
                     ownerAcctId);
             }
 
-            foreach (var packet in SelectCharacterPacketBuilder.BuildPacketStream(_selectCharacterDataSource, ownerCharId, ownerAcctId))
+            SkillInfoSnapshot pvpSkillOverride = null;
+            if (GameNetworkConfig.IsFreeDuelListener(session.ListenerPort))
+            {
+                var skillOwner = _characterRepository.GetById(ownerCharId);
+                if (skillOwner != null)
+                {
+                    var pvpSkills = new Game.Skills.SqlitePvpSkillRepository(
+                        Infrastructure.ServerPaths.DatabasePath,
+                        Infrastructure.ServerPaths.SchemaFilePath);
+                    pvpSkillOverride = pvpSkills.LoadOrInitialize(
+                        ownerCharId,
+                        skillOwner.Job,
+                        skillOwner.Level,
+                        skillOwner.GrowType);
+                    FileLogger.Log(
+                        $"[{ProtocolName}] Loaded independent PvP skills " +
+                        $"character_id={ownerCharId} " +
+                        $"entries={pvpSkillOverride.Pages[0].Entries.Count}+" +
+                        $"{pvpSkillOverride.Pages[1].Entries.Count}");
+                }
+            }
+
+            foreach (var packet in SelectCharacterPacketBuilder.BuildPacketStream(
+                         _selectCharacterDataSource,
+                         ownerCharId,
+                         ownerAcctId,
+                         pvpSkillOverride,
+                         selectedSpawn))
                 await session.SendPacketAsync(packet);
+
+            if (InventoryContext.TryGetLease(ownerCharId, out var inventoryLease)
+                && inventoryLease.IsOwnedBy(session.SessionId))
+            {
+                if (DailyRefillItemService.TryApply(inventoryLease, out var dailyRefillGrants))
+                {
+                    foreach (var group in dailyRefillGrants
+                        .Where(item => item.SlotIndex >= 0)
+                        .GroupBy(item => item.ListType))
+                    {
+                        await InventoryRefreshSender.SendOnlineUpdateItemList(
+                            session,
+                            group.Key,
+                            group.Select(item => item.SlotIndex));
+                    }
+
+                    if (dailyRefillGrants.Count > 0)
+                        FileLogger.Log(
+                            $"[{ProtocolName}] DAILY_REFILL item updates cid={ownerCharId} count={dailyRefillGrants.Count}");
+                }
+                else
+                {
+                    // The database transaction rolled back. Discard any earlier in-memory
+                    // grants from the same batch before the lease can be persisted later.
+                    inventoryLease.Inventory.ClearDirtyState();
+                    var restoredInventory = TryLoadInventoryForLease(ownerCharId, ownerAcctId);
+                    if (restoredInventory != null)
+                        TryRegisterInventoryLease(
+                            session,
+                            _characterRepository.GetById(ownerCharId),
+                            restoredInventory);
+                    FileLogger.Log(
+                        $"[{ProtocolName}] daily refill rolled back and inventory reloaded cid={ownerCharId}");
+                }
+            }
+
+            var visibilityBits = session.Player.Subtype0Tail?.UserStateBits ?? (byte)3;
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x00,
+                (ushort)NotiPacketType.CHARAC_INVISIBLE_FALGS,
+                CharacterVisibilityBodyBuilder.Build(session.Player.UserId, visibilityBits)));
 
             var cloneTitle = AppearanceService.LoadCloneTitleItemId(ownerCharId);
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
@@ -254,36 +441,128 @@ namespace DfoServer.Network.Handlers
         {
             try
             {
-                // 他人外观(同屏 PULL 模型): body = {u16 uid, byte mode}(见 docs/df_game_r/06-otheruser-appearance.md)。
-                // mode!=2 且 uid 有效且目标在线 → 回目标 USERINFO(0x0002, 复用自身版 BuildNoti2Body 换数据源)。
-                // 自身/选角 roster(mode==2 或 body<3B)走下面既有分支。⚠️ 真机需确认客户端是否用 0x0008 发他人请求 + mode 取值。
-                // 诊断: 查看信息(inspect)真机排查用。记录客户端发的完整 body, 好核对 reqUid 映射。
+                // body = {u16 targetUserId, u8 mode}. Modes 0, 1 and 3 are
+                // target-relative inspect flows; only mode 2 returns the
+                // authenticated requester's account roster. Invalid, stale,
+                // ambiguous or cross-channel targets fail closed.
                 FileLogger.Log($"[{ProtocolName}] GET_USERINFO body={(body != null ? BitConverter.ToString(body) : "null")} selfUid={session.Player?.UserId} selfCid={session.Player?.CharacterId}");
+                if (_sessions == null || body == null || body.Length < 3)
+                {
+                    FileLogger.Log(
+                        $"[{ProtocolName}] GET_USERINFO rejected malformed " +
+                        $"request bodyLen={body?.Length ?? 0}");
+                    return;
+                }
+
                 if (_sessions != null && body != null && body.Length >= 3)
                 {
                     ushort reqUid = BitConverter.ToUInt16(body, 0);
                     byte mode = body[2];
-                    if (mode != 0x02 && reqUid != 0xFFFF && reqUid != session.Player.UserId)
+                    if (mode != 0x00
+                        && mode != 0x01
+                        && mode != 0x02
+                        && mode != 0x03)
                     {
-                        var target = FindOnlineByUserId(reqUid);
-                        if (target != null)
+                        FileLogger.Log(
+                            $"[{ProtocolName}] GET_USERINFO rejected " +
+                            $"unknown mode={mode}");
+                        return;
+                    }
+                    if (mode != 0x02)
+                    {
+                        if (reqUid == 0xFFFF)
                         {
-                            // ⚠️ 待真机验证: inspect(mode=3)可能需要【完整明细 subtype-1】而不只精简外观 subtype-0。
-                            //    先发 subtype-0(与同屏他人外观同源, 已验证能渲染外观); 若信息窗仍空, 晨间加发 subtype-1。
-                            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0002, Game.Appearance.AppearanceService.BuildNoti2Body(target.Player)));
-                            FileLogger.Log($"[{ProtocolName}] GET_USERINFO other MATCH reqUid={reqUid} mode={mode} -> USERINFO(0x0002 subtype0) sent (targetCid={target.Player.CharacterId})");
+                            FileLogger.Log(
+                                $"[{ProtocolName}] GET_USERINFO inspect " +
+                                "rejected invalid uid=0xFFFF");
                             return;
                         }
-                        // 未匹配 → 枚举在线 uid, 让真机日志直接显示 reqUid 是否=某在线目标的 UserId(诊断 uid 映射)
+                        if (!IsAuthorizedInspectRequester(session))
+                        {
+                            FileLogger.Log(
+                                $"[{ProtocolName}] GET_USERINFO inspect " +
+                                $"rejected unauthenticated/stale requester");
+                            return;
+                        }
+                        var target = FindInspectableOnlineByUserId(
+                            _sessions,
+                            session,
+                            reqUid);
+                        if (target != null)
+                        {
+                            var otherRoutingByte =
+                                _getUserInfoTemplate?.Pkt0RoutingByte7
+                                ?? (byte)0x01;
+                            var packets = OtherUserInfoResponseBuilder.Build(
+                                _selectCharacterDataSource,
+                                _characterRepository,
+                                target,
+                                mode,
+                                otherRoutingByte,
+                                out var detailError);
+                            if (!IsAuthorizedInspectRequester(session)
+                                || !IsCurrentInspectableTarget(
+                                    session,
+                                    target,
+                                    reqUid))
+                            {
+                                FileLogger.Log(
+                                    $"[{ProtocolName}] GET_USERINFO " +
+                                    $"generation changed before response " +
+                                    $"uid={reqUid}");
+                                return;
+                            }
+                            foreach (var packet in packets)
+                            {
+                                if (!IsAuthorizedInspectRequester(session)
+                                    || !IsCurrentInspectableTarget(
+                                        session,
+                                        target,
+                                        reqUid))
+                                {
+                                    FileLogger.Log(
+                                        $"[{ProtocolName}] GET_USERINFO " +
+                                        $"response aborted after generation " +
+                                        $"change uid={reqUid}");
+                                    return;
+                                }
+                                await session.SendPacketAsync(packet);
+                            }
+                            FileLogger.Log(
+                                $"[{ProtocolName}] GET_USERINFO other MATCH " +
+                                $"reqUid={reqUid} mode={mode} " +
+                                $"packets={packets.Count} " +
+                                $"detailError={detailError ?? "none"} " +
+                                $"targetCid={target.Player.CharacterId}");
+                            return;
+                        }
                         var sb = new System.Text.StringBuilder();
                         foreach (var s in _sessions.GetAllGameSessions())
-                            if (s?.Player != null && s.Player.CharacterId > 0)
+                        {
+                            if (s?.Player != null
+                                && s.Player.CharacterId > 0
+                                && PartyHandler.IsSameGameChannel(session, s))
+                            {
                                 sb.Append($"uid{s.Player.UserId}/cid{s.Player.CharacterId} ");
-                        FileLogger.Log($"[{ProtocolName}] GET_USERINFO other reqUid={reqUid} mode={mode} 未匹配在线目标, 回退 roster(⚠️信息窗无反应根因候选=uid映射). 在线=[{sb.ToString().Trim()}]");
+                            }
+                        }
+                        FileLogger.Log(
+                            $"[{ProtocolName}] GET_USERINFO other reqUid={reqUid} " +
+                            $"mode={mode} no same-channel target; " +
+                            $"online=[{sb.ToString().Trim()}]");
+                        // Do not send the requester's roster into an inspect flow.
+                        return;
                     }
                 }
 
-                var accountId = session.Account?.AccountId ?? 1;
+                var accountId = session.Account?.AccountId ?? 0;
+                if (accountId <= 0)
+                {
+                    FileLogger.Log(
+                        $"[{ProtocolName}] GET_USERINFO roster rejected " +
+                        "unauthenticated requester");
+                    return;
+                }
                 var characterList = BuildCharacterList(accountId);
                 byte routingByte = _getUserInfoTemplate != null ? _getUserInfoTemplate.Pkt0RoutingByte7 : (byte)0;
                 await session.SendPacketAsync(BuildPacketWithRouting(0x00, 0x0002, characterList.Body, routingByte));
@@ -296,6 +575,86 @@ namespace DfoServer.Network.Handlers
             {
                 FileLogger.Log($"[{ProtocolName}] GET_USERINFO EXCEPTION: {ex}");
             }
+        }
+
+        public async Task Handle_ENUM_CMDPACKET_OTHER_USER_TITLE_BOOK_LIST(
+            EnhancedClientSession session,
+            GamePacketHeader header,
+            byte[] body)
+        {
+            if (!IsAuthorizedInspectRequester(session))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] OTHER_USER_TITLE_BOOK_LIST " +
+                    $"rejected unauthenticated/stale requester");
+                return;
+            }
+
+            if (_sessions == null || body == null || body.Length < 2)
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] OTHER_USER_TITLE_BOOK_LIST rejected: " +
+                    $"bodyLen={body?.Length ?? 0} sessions={_sessions != null}");
+                return;
+            }
+
+            var requestedUserId = BitConverter.ToUInt16(body, 0);
+            if (requestedUserId == 0xFFFF)
+            {
+                return;
+            }
+
+            var target = FindInspectableOnlineByUserId(
+                _sessions,
+                session,
+                requestedUserId);
+            if (target == null)
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] OTHER_USER_TITLE_BOOK_LIST " +
+                    $"uid={requestedUserId} no same-channel target");
+                return;
+            }
+
+            var packets = OtherUserInfoResponseBuilder.BuildTitleBookList(
+                _selectCharacterDataSource,
+                _characterRepository,
+                target,
+                infoType: 1,
+                out var error);
+            if (!IsAuthorizedInspectRequester(session)
+                || !IsCurrentInspectableTarget(
+                    session,
+                    target,
+                    requestedUserId))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] OTHER_USER_TITLE_BOOK_LIST " +
+                    $"generation changed before response " +
+                    $"uid={requestedUserId}");
+                return;
+            }
+            foreach (var packet in packets)
+            {
+                if (!IsAuthorizedInspectRequester(session)
+                    || !IsCurrentInspectableTarget(
+                        session,
+                        target,
+                        requestedUserId))
+                {
+                    FileLogger.Log(
+                        $"[{ProtocolName}] OTHER_USER_TITLE_BOOK_LIST " +
+                        $"response aborted after generation change " +
+                        $"uid={requestedUserId}");
+                    return;
+                }
+                await session.SendPacketAsync(packet);
+            }
+
+            FileLogger.Log(
+                $"[{ProtocolName}] OTHER_USER_TITLE_BOOK_LIST " +
+                $"uid={requestedUserId} packets={packets.Count} " +
+                $"error={error ?? "none"}");
         }
 
         private static bool NameBytesEqual(byte[] a, byte[] b)
@@ -489,6 +848,17 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
+            if (_mercenaryRestrictions != null && !_mercenaryRestrictions.CanDelete(target.CharacterId))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] DELETE_CHARACTER blocked: character_id={target.CharacterId} is on mercenary expedition");
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01,
+                    0x0006,
+                    new byte[] { 0x28 }));
+                return;
+            }
+
             try
             {
                 _characterRepository.SoftDelete(target.CharacterId);
@@ -522,7 +892,10 @@ namespace DfoServer.Network.Handlers
                     $"for character_id={session.Player.CharacterId}");
             }
 
-            Dungeon.DungeonRunLifecycle.EndRunOnTeardown(session, "return_select_character");
+            Dungeon.DungeonRunLifecycle.EndRunOnTeardown(
+                session,
+                "return_select_character",
+                _dungeonInstances);
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0007, CommonPacketBodyBuilder.BuildSuccessAck()));
             FileLogger.Log($"[{ProtocolName}] RETURN_SELECT_CHARACTER: sent ACK for session {session.SessionId}");
             await SendCharacterListAsync(session);

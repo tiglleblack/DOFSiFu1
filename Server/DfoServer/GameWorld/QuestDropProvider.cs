@@ -10,11 +10,13 @@ namespace DfoServer.GameWorld
         public int Count;
         public int DropRate;
         public int MaxStack;
+        public int SeekingRequiredCount;
         public bool PreferQuestInventory;
     }
 
     public static class QuestDropProvider
     {
+        public const int EnemyTypeMonster = 1;
         public const int EnemyTypeAiCharacter = 2;
         public const int EnemyTypePassiveObject = 3;
 
@@ -55,6 +57,41 @@ namespace DfoServer.GameWorld
                             Count = entry.Count,
                             DropRate = entry.DropRate,
                             MaxStack = entry.MaxStack,
+                            SeekingRequiredCount =
+                                GetSeekingRequiredCount(
+                                    questId,
+                                    entry.ItemId),
+                            PreferQuestInventory =
+                                IsSeekingTargetItem(
+                                    questId,
+                                    entry.ItemId),
+                        });
+                    }
+
+                    foreach (var entry in qst.EnemyRewardItems)
+                    {
+                        if (entry.EnemyType != EnemyTypeMonster
+                            || entry.EnemyCode != monsterCode
+                            || !MatchesScope(
+                                entry.DungeonId,
+                                entry.Difficulty,
+                                dungeonIndex,
+                                difficulty))
+                        {
+                            continue;
+                        }
+
+                        results.Add(new QuestDropCandidate
+                        {
+                            QuestId = questId,
+                            ItemId = entry.ItemId,
+                            Count = entry.Count,
+                            DropRate = entry.DropRate,
+                            MaxStack = entry.MaxStack,
+                            SeekingRequiredCount =
+                                GetSeekingRequiredCount(
+                                    questId,
+                                    entry.ItemId),
                             PreferQuestInventory =
                                 IsSeekingTargetItem(
                                     questId,
@@ -70,6 +107,97 @@ namespace DfoServer.GameWorld
             }
 
             return results.Count > 0 ? results : null;
+        }
+
+        public static List<QuestDropCandidate> CheckMonsterCaptureDrop(
+            ICollection<int> activeQuestIds,
+            IReadOnlyList<MonsterCaptureItemDefinition> captureItems)
+        {
+            if (activeQuestIds == null
+                || activeQuestIds.Count == 0
+                || captureItems == null
+                || captureItems.Count == 0)
+            {
+                return null;
+            }
+
+            var captureItemIds = new HashSet<int>();
+            foreach (var item in captureItems)
+            {
+                if (item.ItemId > 0)
+                    captureItemIds.Add(item.ItemId);
+            }
+
+            var questByItem = new Dictionary<int, int>();
+            var requiredByItem = new Dictionary<int, int>();
+            foreach (var questId in activeQuestIds)
+            {
+                try
+                {
+                    var seekingItems = QuestData.GetSeekingConsumeItems(questId);
+                    if (seekingItems == null)
+                        continue;
+
+                    foreach (var seeking in seekingItems)
+                    {
+                        if (seeking.ItemId <= 0
+                            || seeking.Count <= 0
+                            || !captureItemIds.Contains(seeking.ItemId))
+                        {
+                            continue;
+                        }
+
+                        var required = GetSeekingRequiredCount(
+                            questId,
+                            seeking.ItemId);
+                        if (required <= 0)
+                            continue;
+                        if (!requiredByItem.TryGetValue(
+                                seeking.ItemId,
+                                out var currentRequired)
+                            || required > currentRequired)
+                        {
+                            requiredByItem[seeking.ItemId] = required;
+                        }
+                        if (!questByItem.TryGetValue(
+                                seeking.ItemId,
+                                out var currentQuestId)
+                            || questId < currentQuestId)
+                        {
+                            questByItem[seeking.ItemId] = questId;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    FileLogger.Log(
+                        $"[QuestDropProvider] ERROR: capture seeking match failed, "
+                        + $"quest {questId} skipped: {ex.Message}");
+                }
+            }
+
+            var result = new List<QuestDropCandidate>();
+            foreach (var item in captureItems)
+            {
+                if (!requiredByItem.TryGetValue(item.ItemId, out var required)
+                    || !questByItem.TryGetValue(item.ItemId, out var questId))
+                {
+                    continue;
+                }
+
+                result.Add(new QuestDropCandidate
+                {
+                    QuestId = questId,
+                    ItemId = item.ItemId,
+                    Count = item.Count,
+                    DropRate = item.DropRate,
+                    MaxStack = required,
+                    SeekingRequiredCount = required,
+                    PreferQuestInventory = true,
+                });
+            }
+
+            return result.Count > 0 ? result : null;
         }
 
         public static List<QuestDropCandidate> CheckClearReward(
@@ -109,6 +237,10 @@ namespace DfoServer.GameWorld
                             Count = entry.Count,
                             DropRate = entry.DropRate,
                             MaxStack = entry.MaxStack,
+                            SeekingRequiredCount =
+                                GetSeekingRequiredCount(
+                                    questId,
+                                    entry.ItemId),
                             PreferQuestInventory =
                                 IsSeekingTargetItem(
                                     questId,
@@ -159,6 +291,10 @@ namespace DfoServer.GameWorld
                             Count = entry.Count,
                             DropRate = entry.DropRate,
                             MaxStack = entry.MaxStack,
+                            SeekingRequiredCount =
+                                GetSeekingRequiredCount(
+                                    questId,
+                                    entry.ItemId),
                             PreferQuestInventory =
                                 IsSeekingTargetItem(
                                     questId,
@@ -184,6 +320,22 @@ namespace DfoServer.GameWorld
                 item => item.ItemId == itemId && item.Count > 0);
         }
 
+        private static int GetSeekingRequiredCount(int questId, int itemId)
+        {
+            if (questId <= 0 || itemId <= 0)
+                return -1;
+
+            long required = 0;
+            foreach (var item in QuestData.GetSeekingConsumeItems(questId))
+            {
+                if (item.ItemId == itemId && item.Count > 0)
+                    required += item.Count;
+            }
+            if (required <= 0)
+                return -1;
+            return required > int.MaxValue ? int.MaxValue : (int)required;
+        }
+
         private static bool MatchesScope(int dungeonId, int rewardDifficulty, int dungeonIndex, int difficulty)
         {
             if (dungeonId != -1 && dungeonId != dungeonIndex)
@@ -202,7 +354,8 @@ namespace DfoServer.GameWorld
         /// </summary>
         public static int RollDrop(QuestDropCandidate candidate, int currentHeld)
         {
-            if (candidate.MaxStack != -1 && currentHeld >= candidate.MaxStack)
+            var effectiveLimit = GetEffectiveHeldLimit(candidate);
+            if (effectiveLimit >= 0 && currentHeld >= effectiveLimit)
                 return 0;
 
             int actual = 0;
@@ -216,10 +369,24 @@ namespace DfoServer.GameWorld
             if (actual <= 0) return 0;
             if (actual > 999) actual = 999;
 
-            if (candidate.MaxStack != -1 && currentHeld + actual > candidate.MaxStack)
-                actual = candidate.MaxStack - currentHeld;
+            if (effectiveLimit >= 0 && currentHeld + actual > effectiveLimit)
+                actual = effectiveLimit - currentHeld;
 
             return Math.Max(0, actual);
+        }
+
+        public static int GetEffectiveHeldLimit(QuestDropCandidate candidate)
+        {
+            var limit = candidate.MaxStack >= 0
+                ? candidate.MaxStack
+                : -1;
+            if (candidate.SeekingRequiredCount > 0)
+            {
+                limit = limit < 0
+                    ? candidate.SeekingRequiredCount
+                    : Math.Min(limit, candidate.SeekingRequiredCount);
+            }
+            return limit;
         }
     }
 }

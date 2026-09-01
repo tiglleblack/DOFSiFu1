@@ -27,6 +27,8 @@ namespace DfoServer.SelfTests
         private const short AncientHeroLotterySlot = 109;
         private const short ConcurrentLotterySlot = 110;
         private const short RequiredItemLotterySlot = 111;
+        private const short MagicCapsuleSlot = 112;
+        private const short GoldPotSlot = 113;
         private const short RequiredItemSlot = 157;
         private const short RewardSlot = 120;
         private const int SampleLotteryItemId = 10014964;
@@ -36,9 +38,21 @@ namespace DfoServer.SelfTests
         private const int AncientHeroLotteryItemId = 8213;
         private const int RequiredItemLotteryItemId = 10007501;
         private const int RequiredLotteryMaterialItemId = 10007498;
+        private const int MagicCapsuleItemId = 10089090;
+        private const int MagicCapsulePrimaryRewardItemId = 10089088;
+        private const int MagicCapsuleSecondaryRewardItemId = 3116;
         private const int CannedAvatarItemId = 39075;
         private const int LegacyEquipmentItemId = 100150516;
         private const int EpicEquipmentItemId = 101000004;
+        private const int FixedGoldPotItemId = 10094732;
+        private const int FixedGoldPotReward = 50000;
+        private static readonly int[] GoldPotItemIds =
+        {
+            7614, 7615, 7616, 7806, 7808, 7809, 7819, 2680513, 2680750,
+            10002257, 10002874, 10002912, 10002913, 10002914, 10003866,
+            10094732, 10094734, 10094736, 10094786, 10094787, 10094788,
+            10094789, 10094790,
+        };
 
         public static int Run()
         {
@@ -72,11 +86,70 @@ namespace DfoServer.SelfTests
             Check("reject unrelated overflow confirm", !LotteryItemHandler.IsLotteryOverflowConfirm(
                 new byte[] { 0x01, 0x1A, 0x00 }), ref failures);
 
+            var resetRequestBody = new byte[21];
+            Buffer.BlockCopy(BitConverter.GetBytes((short)113), 0, resetRequestBody, 13, 2);
+            Buffer.BlockCopy(BitConverter.GetBytes(0x0098B414), 0, resetRequestBody, 17, 4);
+            Check("parse increase chance reset request",
+                IncreaseChanceLotteryResetRequest.TryParse(resetRequestBody, out var resetRequest)
+                && resetRequest.SlotIndex == 113
+                && resetRequest.ItemTemplateId == 0x0098B414,
+                ref failures);
+            Check("reject malformed increase chance reset request",
+                !IncreaseChanceLotteryResetRequest.TryParse(new byte[20], out _),
+                ref failures);
+
+            var progress = new LotteryProgressSnapshot
+            {
+                ItemTemplateId = 0x0098B414,
+                NewRewardIndex = 6,
+            };
+            progress.ClaimedRewardIndexes.Add(1);
+            progress.ClaimedRewardIndexes.Add(6);
+            var progressBody = IncreaseChanceLotteryPacketBuilder.BuildAllState(progress);
+            Check("increase chance all-state body layout",
+                progressBody.Length == 204
+                && BitConverter.ToInt32(progressBody, 0) == 2
+                && BitConverter.ToInt32(progressBody, 4) == 0x0098B414
+                && BitConverter.ToInt32(progressBody, 8) == 7
+                && BitConverter.ToInt32(progressBody, 12) == 0x0098B414
+                && progressBody[16] == 2
+                && progressBody[17] == 7,
+                ref failures);
+            var resetResponse = IncreaseChanceLotteryPacketBuilder.BuildResetResponse(0, true);
+            Check("increase chance reset response layout",
+                 resetResponse.Length == 1
+                && resetResponse[0] == 1,
+                ref failures);
+            var failedResetResponse = IncreaseChanceLotteryPacketBuilder.BuildResetResponse(1, false);
+            Check("increase chance reset error response layout",
+                failedResetResponse.Length == 2
+                && failedResetResponse[0] == 0
+                && failedResetResponse[1] == 1,
+                ref failures);
+            var emptyProgressBody = IncreaseChanceLotteryPacketBuilder.BuildAllState(
+                (LotteryProgressSnapshot)null);
+            Check("increase chance empty-state body layout",
+                emptyProgressBody.Length == 204
+                && emptyProgressBody.All(value => value == 0),
+                ref failures);
+
             var phaseStart = LotteryItemAckBuilder.BuildPhaseStartWithoutPreview();
             Check("phase start body length", phaseStart.Length == 13, ref failures);
             Check("phase start hides source slot", BitConverter.ToInt16(phaseStart, 1) == -1, ref failures);
             Check("phase start hides preview", BitConverter.ToInt32(phaseStart, 5) == 0
                 && BitConverter.ToInt32(phaseStart, 9) == 0, ref failures);
+
+            var goldResult = LotteryItemAckBuilder.BuildGoldResult(
+                GoldPotSlot,
+                FixedGoldPotReward);
+            Check("gold lottery result body layout",
+                goldResult.Length == 22
+                && goldResult[0] == 1
+                && BitConverter.ToInt16(goldResult, 1) == GoldPotSlot
+                && BitConverter.ToInt16(goldResult, 3) == 0
+                && BitConverter.ToInt32(goldResult, 5) == 0
+                && BitConverter.ToInt32(goldResult, 9) == FixedGoldPotReward,
+                ref failures);
 
             var rewardItem = ItemCore.Create(ItemCore.KindEquipment, SampleRewardItemId);
             rewardItem.Value = 0x13572468;
@@ -207,6 +280,19 @@ namespace DfoServer.SelfTests
             Check("PVF magic box is not a lottery", !definitions.TryGet(
                 MagicBoxItemId,
                 out _), ref failures);
+            Check("PVF magic capsule legacy definition", definitions.TryGet(
+                MagicCapsuleItemId,
+                out var magicCapsuleDefinition)
+                && magicCapsuleDefinition.StackableType == StackableItemProvider.LegacyType
+                && magicCapsuleDefinition.RewardPool.Count == 2
+                && magicCapsuleDefinition.RewardPool.Any(reward =>
+                    reward.ItemId == MagicCapsulePrimaryRewardItemId
+                    && reward.Weight == 80000
+                    && reward.Count == 1)
+                && magicCapsuleDefinition.RewardPool.Any(reward =>
+                    reward.ItemId == MagicCapsuleSecondaryRewardItemId
+                    && reward.Weight == 20000
+                    && reward.Count == 1), ref failures);
             Check("hero lottery gold cost comes from PVF", definitions.TryGet(
                 HeroLotteryItemId,
                 out var heroDefinition)
@@ -220,6 +306,15 @@ namespace DfoServer.SelfTests
                 out var requiredItemDefinition)
                 && requiredItemDefinition.RequiredItemTemplateId == RequiredLotteryMaterialItemId
                 && requiredItemDefinition.RequiredItemCount == 1, ref failures);
+            Check("PVF gold pots preserve itemId zero reward rows",
+                GoldPotItemIds.All(itemId =>
+                    definitions.TryGet(itemId, out var definition)
+                    && definition.RewardPool.Count > 0
+                    && definition.RewardPool.All(reward =>
+                        reward.ItemId == 0
+                        && reward.Weight > 0
+                        && reward.Count > 0)),
+                ref failures);
             var syntheticItemId = 7654321;
             var syntheticGoldCost = 1234567;
             var syntheticLottery = new PvfLib.StackableItemFile
@@ -288,7 +383,8 @@ namespace DfoServer.SelfTests
             var service = new LotteryItemOpenService(
                 connectionString,
                 definitions,
-                doublePolicy);
+                doublePolicy,
+                _ => 800000000);
             var planner = new LotteryOpenPlanner(doublePolicy);
             var inventory = CreateLotteryInventory();
             var hasHeroDefinition = definitions.TryGet(
@@ -335,6 +431,31 @@ namespace DfoServer.SelfTests
                 && normalResult.Rewards.Count > 0
                 && !normalResult.UsedDoubleReward, ref failures);
 
+            Check("magic capsule phase0 precheck", service.CanOpen(
+                inventory,
+                MagicCapsuleSlot,
+                out var magicCapsuleSource)
+                && magicCapsuleSource.ItemTemplateId == MagicCapsuleItemId, ref failures);
+            Check("magic capsule opens and consumes one", service.TryOpen(
+                inventory,
+                MagicCapsuleSlot,
+                false,
+                RejectingInventoryOverflowRewardSink.Instance,
+                out var magicCapsuleResult)
+                && magicCapsuleResult.SourceRemainingStackCount == 0
+                && magicCapsuleResult.Rewards.Count == 1
+                && (magicCapsuleResult.Rewards[0].ItemTemplateId == MagicCapsulePrimaryRewardItemId
+                    || magicCapsuleResult.Rewards[0].ItemTemplateId == MagicCapsuleSecondaryRewardItemId),
+                ref failures);
+            Check("PVF increase chance lottery definition", definitions.TryGet(
+                0x0098B414,
+                out var increaseChanceDefinition)
+                && increaseChanceDefinition.UsesIncreaseChanceProgress
+                && increaseChanceDefinition.ProgressResetCount == 9
+                && increaseChanceDefinition.ProgressResetGoldCost == 2000000
+                && increaseChanceDefinition.RewardPool.Count == 10,
+                ref failures);
+
             var startConcurrentOpen = new ManualResetEventSlim(false);
             var concurrentResults = new bool[2];
             var concurrentSync = new object();
@@ -371,6 +492,43 @@ namespace DfoServer.SelfTests
                 RejectingInventoryOverflowRewardSink.Instance,
                 out var legacyResult)
                 && legacyResult.Rewards.Count > 0, ref failures);
+
+            Check("fixed gold pot credits PVF amount and consumes one", service.TryOpen(
+                inventory,
+                GoldPotSlot,
+                false,
+                RejectingInventoryOverflowRewardSink.Instance,
+                out var goldPotResult)
+                && goldPotResult.SourceRemainingStackCount == 0
+                && goldPotResult.GrantedGold == FixedGoldPotReward
+                && goldPotResult.UpdatedGold == FixedGoldPotReward
+                && goldPotResult.Rewards.Count == 1
+                && goldPotResult.Rewards[0].ItemTemplateId == 0
+                && goldPotResult.Rewards[0].GrantedCount == FixedGoldPotReward,
+                ref failures);
+            SetGold(inventory, 0);
+
+            var goldOverflowInventory = new InventoryService(CharacterId, AccountId);
+            goldOverflowInventory.SetListParam16(InventoryListType.Main, 24);
+            AttachStackable(
+                goldOverflowInventory,
+                GoldPotSlot,
+                FixedGoldPotItemId,
+                1);
+            SetGold(goldOverflowInventory, 799950001);
+            Check("gold pot rejects carry-limit overflow without consuming",
+                !service.TryOpen(
+                    goldOverflowInventory,
+                    GoldPotSlot,
+                    false,
+                    RejectingInventoryOverflowRewardSink.Instance,
+                    out _)
+                && LoadStackCount(
+                    goldOverflowInventory,
+                    GoldPotSlot,
+                    FixedGoldPotItemId) == 1
+                && goldOverflowInventory.CountMainItem(0) == 799950001,
+                ref failures);
 
             Check("hero pot rejects insufficient gold", !service.CanOpen(
                 inventory,
@@ -547,6 +705,8 @@ VALUES (@accountId, @premiumType, @endTime);
             AttachStackable(inventory, AncientHeroLotterySlot, AncientHeroLotteryItemId, 1);
             AttachStackable(inventory, ConcurrentLotterySlot, SampleLotteryItemId, 1);
             AttachStackable(inventory, RequiredItemLotterySlot, RequiredItemLotteryItemId, 1);
+            AttachStackable(inventory, MagicCapsuleSlot, MagicCapsuleItemId, 1);
+            AttachStackable(inventory, GoldPotSlot, FixedGoldPotItemId, 1);
             AttachStackable(inventory, RequiredItemSlot, RequiredLotteryMaterialItemId, 1);
             inventory.ClearDirtyState();
             return inventory;
@@ -558,12 +718,18 @@ VALUES (@accountId, @premiumType, @endTime);
             int itemTemplateId,
             int count)
         {
-            var core = InventoryCreateService.CreateCore(
-                ItemCore.KindConsumable,
-                itemTemplateId,
-                ItemCreateReason.Unknown,
-                count);
+            if (!InventoryCreateService.TryCreateCore(
+                    itemTemplateId,
+                    ItemCreateReason.Unknown,
+                    count,
+                    out var core))
+            {
+                throw new InvalidOperationException(
+                    $"Unable to create PVF-backed lottery fixture item {itemTemplateId}.");
+            }
+
             core.Count = count;
+            core.ExpireTime = 0;
             inventory.AttachItem(InventoryListType.Main, slotIndex, core);
         }
 

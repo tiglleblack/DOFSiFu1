@@ -1,5 +1,8 @@
 using DfoServer.Game.Currency;
+using DfoServer.Game.Dungeon;
+using DfoServer.Game.ExpertJob;
 using DfoServer.Game.Inventory;
+using DfoServer.Game.Mailbox;
 using DfoServer.Network.Builders;
 using DfoServer.Network.Parsers.Inventory;
 using System;
@@ -12,6 +15,112 @@ namespace DfoServer.Network.Handlers
 {
     public sealed partial class InventoryHandler
     {
+        internal async Task<bool> TryHandleDungeonUseStackable(
+            EnhancedClientSession session,
+            GamePacketHeader header,
+            byte[] body)
+        {
+            if (body == null || body.Length < 7)
+                return false;
+
+            var rewardPolicy = session?.Player?.CurrentRun?.RewardPolicy;
+            if (DungeonInteractionPolicy.Resolve(rewardPolicy)
+                .ConsumesStackableItems)
+            {
+                return false;
+            }
+
+            var slotIndex = BitConverter.ToInt16(body, 0);
+            var listType = (InventoryListType)body[2];
+            var instanceValue = BitConverter.ToInt32(body, 3);
+            var itemCode = body.Length >= 11 ? BitConverter.ToInt32(body, 7) : 0;
+            var (characterId, _) = ResolveOwner(session);
+
+            InventoryLease lease = null;
+            TryGetOwnedInventoryLease(session, characterId, out lease);
+            UseStackableResponsePlan responsePlan;
+            if (lease == null)
+            {
+                TryBuildDungeonUseStackableResponsePlan(
+                    rewardPolicy,
+                    null,
+                    listType,
+                    slotIndex,
+                    instanceValue,
+                    itemCode,
+                    out responsePlan);
+            }
+            else
+            {
+                lock (lease.SyncRoot)
+                {
+                    TryBuildDungeonUseStackableResponsePlan(
+                        rewardPolicy,
+                        lease.Inventory,
+                        listType,
+                        slotIndex,
+                        instanceValue,
+                        itemCode,
+                        out responsePlan);
+                }
+            }
+
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x01,
+                0x002C,
+                responsePlan.AckBody));
+            if (responsePlan.RefreshSourceSlot)
+                await _refresh.SendUpdateItemList(session, listType, slotIndex);
+            FileLogger.Log(
+                $"[{ProtocolName}] USE_STACKABLE training: " +
+                $"cid={characterId} list={listType} slot={slotIndex} " +
+                $"item=0x{itemCode:X8} accepted={responsePlan.Accepted} " +
+                "persistentCountUnchanged=true");
+            return true;
+        }
+
+        internal static bool TryBuildDungeonUseStackableResponsePlan(
+            DungeonRewardPolicy rewardPolicy,
+            InventoryService inventory,
+            InventoryListType listType,
+            short slotIndex,
+            int instanceValue,
+            int itemCode,
+            out UseStackableResponsePlan responsePlan)
+        {
+            responsePlan = null;
+            if (DungeonInteractionPolicy.Resolve(rewardPolicy)
+                .ConsumesStackableItems)
+            {
+                return false;
+            }
+
+            var valid = InventoryDeleteService.CanUseStackableForClient(
+                inventory,
+                listType,
+                slotIndex,
+                itemCode,
+                out var resolvedItemId);
+            var responseItemCode = itemCode > 0 ? itemCode : resolvedItemId;
+            responsePlan = new UseStackableResponsePlan
+            {
+                AckBody = valid
+                    ? UseStackableAckBuilder.BuildPracticeSuccess(
+                        (byte)listType,
+                        instanceValue,
+                        responseItemCode)
+                    : UseStackableAckBuilder.BuildError(
+                        (byte)listType,
+                        instanceValue,
+                        responseItemCode),
+                ItemListUpdateBody = null,
+                StalePetConsumable = false,
+                RefreshSourceSlot = false,
+                Accepted = valid,
+            };
+            return true;
+        }
+
         public async Task Handle_ENUM_CMDPACKET_USE_STACKABLE(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
 
@@ -24,6 +133,22 @@ namespace DfoServer.Network.Handlers
             var itemCode = body.Length >= 11 ? BitConverter.ToInt32(body, 7) : 0;
 
             var (cid, aid) = ResolveOwner(session);
+
+            if (await TryRejectChannelRestrictedTeleportConsumableAsync(
+                    session,
+                    header,
+                    cid,
+                    listType,
+                    slotIndex,
+                    instanceValue,
+                    itemCode))
+            {
+                return;
+            }
+
+            if (await TryHandleExpertJobRecipeLearning(
+                    session, cid, listType, slotIndex, instanceValue, itemCode))
+                return;
 
             AccountCargoUpgradeToolResult accountCargoToolResult = null;
             bool accountCargoToolHandled = false;
@@ -80,6 +205,32 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
+            // [unlimited ...] 无限次使用道具（如无限猫头鹰 ID51）：校验物品存在后回成功 ACK，但不扣数量。
+            if (itemCode > 0 && IsUnlimitedUseStackable(itemCode))
+            {
+                var unlimitedUsable = false;
+                if (TryGetOwnedInventoryLease(session, cid, out lease))
+                {
+                    lock (lease.SyncRoot)
+                        unlimitedUsable = InventoryDeleteService.CanUseStackableForClient(
+                            lease.Inventory,
+                            listType,
+                            slotIndex,
+                            itemCode,
+                            out _);
+                }
+
+                if (unlimitedUsable)
+                {
+                    await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                        0x01,
+                        0x002C,
+                        UseStackableAckBuilder.BuildSuccess(slotIndex, (byte)listType, instanceValue, itemCode)));
+                    FileLogger.Log($"[{ProtocolName}] USE_STACKABLE: unlimited-use item 0x{itemCode:X8} at listType={listType} slot={slotIndex} acknowledged without consumption");
+                    return;
+                }
+            }
+
             var consumed = false;
             InventoryMutationResult result = null;
             if (TryGetOwnedInventoryLease(session, cid, out lease))
@@ -104,11 +255,221 @@ namespace DfoServer.Network.Handlers
             }
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x002C, responsePlan.AckBody));
+            session.GameSession?.QuestManager
+                ?.RecalibrateItemSeekingQuestProgressAfterInventoryMutationWithoutNotification(
+                    lease,
+                    result);
 
             var petSatietyLog = result.PetSatietyChanged
                 ? $" petSatiety key={result.PetCreatureKey} {result.PetSatietyBefore}->{result.PetSatietyAfter}"
                 : string.Empty;
             FileLogger.Log($"[{ProtocolName}] USE_STACKABLE: consumed 1x item 0x{itemCode:X8} from slot {slotIndex}, remaining={result.RemainingStackCount}{petSatietyLog}");
+        }
+
+        private async Task<bool>
+            TryRejectChannelRestrictedTeleportConsumableAsync(
+                EnhancedClientSession session,
+                GamePacketHeader header,
+                int characterId,
+                InventoryListType listType,
+                short slotIndex,
+                int instanceValue,
+                int expectedItemTemplateId)
+        {
+            if (!GameNetworkConfig.IsChannel100Listener(
+                    session.ListenerPort)
+                || !TryGetOwnedInventoryLease(
+                    session,
+                    characterId,
+                    out var lease))
+            {
+                return false;
+            }
+
+            var itemTemplateId = 0;
+            lock (lease.SyncRoot)
+            {
+                if (!InventoryContext.IsCurrentLease(
+                        lease,
+                        session.SessionId,
+                        characterId))
+                {
+                    return false;
+                }
+
+                var source = lease.Inventory.GetItem(
+                    listType,
+                    slotIndex);
+                if (source == null
+                    || source.ItemId <= 0
+                    || expectedItemTemplateId > 0
+                    && source.ItemId != expectedItemTemplateId)
+                {
+                    return false;
+                }
+
+                itemTemplateId = source.ItemId;
+            }
+
+            if (!TeleportConsumableDefinitionProvider.TryResolve(
+                    itemTemplateId,
+                    out var definition)
+                || GameChannelTeleportPolicy.CanUseConsumable(
+                    session.ListenerPort,
+                    definition))
+            {
+                return false;
+            }
+
+            FileLogger.Log(
+                $"[{ProtocolName}] USE_STACKABLE teleport rejected by " +
+                $"channel policy: cid={characterId} " +
+                $"listener={session.ListenerPort} " +
+                $"item=0x{itemTemplateId:X8} kind={definition.Kind} " +
+                $"targetTown={definition.TargetTownId?.ToString() ?? "dynamic"} " +
+                $"validDefinition={definition.IsValid}");
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x01,
+                header.type,
+                UseStackableAckBuilder.BuildError(
+                    (byte)listType,
+                    instanceValue,
+                    itemTemplateId)));
+            if (_refresh != null)
+            {
+                await _refresh.SendUpdateItemList(
+                    session,
+                    listType,
+                    slotIndex);
+            }
+            await ChannelTownRestrictionSender.SendAsync(session);
+            return true;
+        }
+
+        private async Task<bool> TryHandleExpertJobRecipeLearning(
+            EnhancedClientSession session,
+            int characterId,
+            InventoryListType listType,
+            short slotIndex,
+            int instanceValue,
+            int itemCode)
+        {
+            if (!TryGetOwnedInventoryLease(session, characterId, out var lease))
+                return false;
+
+            var sourceItemId = itemCode;
+            lock (lease.SyncRoot)
+                sourceItemId = lease.Inventory.GetItem(listType, slotIndex)?.ItemId ?? sourceItemId;
+            if (!ExpertJobConfigRegistry.TryResolveRecipe(
+                    sourceItemId,
+                    out var recipeConfig))
+                return false;
+            var recipeExpertJobType = recipeConfig.ExpertJobType;
+            if (session.Player?.Subtype0Tail?.ExpertJobType != recipeExpertJobType)
+            {
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01,
+                    0x002C,
+                    UseStackableAckBuilder.BuildError(
+                        ExpertJobRecipeLearningService.ErrorRequirementsNotMet,
+                        (byte)listType,
+                        instanceValue,
+                        sourceItemId)));
+                return true;
+            }
+
+            var operationGate = _expertJobOperations.GetGate(characterId);
+            await operationGate.WaitAsync();
+            try
+            {
+                var state = _expertJobStates.Load(
+                    characterId,
+                    recipeExpertJobType);
+                ExpertJobRecipeLearningResult result;
+                lock (lease.SyncRoot)
+                {
+                    result = ExpertJobRecipeLearningService.TryLearn(
+                        lease.Inventory,
+                        listType,
+                        slotIndex,
+                        sourceItemId,
+                        session.Player.Subtype0Tail.ExpertJobExp,
+                        state,
+                        recipeConfig);
+                }
+                if (!result.Handled)
+                    return false;
+
+                if (!result.Success)
+                {
+                    await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                        0x01,
+                        0x002C,
+                        UseStackableAckBuilder.BuildError(
+                            result.ErrorCode != 0
+                                ? result.ErrorCode
+                                : ExpertJobRecipeLearningService.ErrorRequirementsNotMet,
+                            (byte)listType,
+                            instanceValue,
+                            sourceItemId)));
+                    return true;
+                }
+
+                var ack = UseStackableAckBuilder.BuildSuccess(
+                    slotIndex,
+                    (byte)listType,
+                    instanceValue,
+                    sourceItemId);
+
+                if (!_expertJobPersistence.Save(
+                        lease,
+                        lease,
+                        (connection, transaction) => _expertJobStates.SaveRecipeInTransaction(
+                            connection,
+                            transaction,
+                            characterId,
+                            result.RecipeId)))
+                {
+                    await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                        0x01,
+                        0x002C,
+                        UseStackableAckBuilder.BuildError(
+                            ExpertJobRecipeLearningService.ErrorRequirementsNotMet,
+                            (byte)listType,
+                            instanceValue,
+                            sourceItemId)));
+                    return true;
+                }
+
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x002C, ack));
+                await _refresh.SendUpdateItemList(session, listType, slotIndex);
+                await SendExpertJobRecipeInfo(
+                    session,
+                    recipeExpertJobType,
+                    state);
+                FileLogger.Log(
+                    $"[{ProtocolName}] EXPERT_JOB_RECIPE cid={characterId} " +
+                    $"type={recipeExpertJobType} " +
+                    $"item={sourceItemId} recipe={result.RecipeId} " +
+                    $"remaining={result.RemainingCount}");
+                return true;
+            }
+            finally
+            {
+                operationGate.Release();
+            }
+        }
+
+        private static async Task SendExpertJobRecipeInfo(
+            EnhancedClientSession session,
+            int expertJobType,
+            ExpertJobState state)
+        {
+            var body = ExpertJobInfoBodyBuilder.BuildProjectedBody(
+                expertJobType,
+                state,
+                session.Player.Subtype0Tail.ExpertJobExp);
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x00CD, body));
         }
 
         public async Task Handle_ADD_EQUIPMENT_EFFECT(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -188,7 +549,7 @@ namespace DfoServer.Network.Handlers
             var responseInstanceValue = instanceValue != 0 ? instanceValue : result.SourceInstanceValue;
             var ackBody = ackOverride ?? (result.Success
                 ? UseStackableAckBuilder.BuildSuccess(slotIndex, (byte)listType, responseInstanceValue, responseItemCode)
-                : UseStackableAckBuilder.BuildError((byte)listType, responseItemCode, responseInstanceValue));
+                : UseStackableAckBuilder.BuildError((byte)listType, responseInstanceValue, responseItemCode));
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, responseType, ackBody));
 
@@ -224,7 +585,7 @@ namespace DfoServer.Network.Handlers
             var responseItemCode = itemCode != 0 ? itemCode : result.ItemTemplateId;
             var ackBody = result.Success
                 ? UseStackableAckBuilder.BuildSuccess(slotIndex, (byte)listType, instanceValue, responseItemCode)
-                : UseStackableAckBuilder.BuildError((byte)listType, responseItemCode, instanceValue);
+                : UseStackableAckBuilder.BuildError((byte)listType, instanceValue, responseItemCode);
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x002C, ackBody));
 
@@ -252,7 +613,7 @@ namespace DfoServer.Network.Handlers
             var responseItemCode = itemCode != 0 ? itemCode : result.ItemTemplateId;
             var ackBody = result.Success
                 ? UseStackableAckBuilder.BuildSuccess(slotIndex, (byte)listType, instanceValue, responseItemCode)
-                : UseStackableAckBuilder.BuildError((byte)listType, responseItemCode, instanceValue);
+                : UseStackableAckBuilder.BuildError((byte)listType, instanceValue, responseItemCode);
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x002C, ackBody));
 
@@ -284,13 +645,14 @@ namespace DfoServer.Network.Handlers
             var responseInstanceValue = instanceValue != 0 ? instanceValue : result?.InstanceValue ?? 0;
             var ackBody = consumed || stalePetConsumable
                 ? UseStackableAckBuilder.BuildSuccess(slotIndex, (byte)listType, responseInstanceValue, responseItemCode)
-                : UseStackableAckBuilder.BuildError((byte)listType, responseItemCode, responseInstanceValue);
+                : UseStackableAckBuilder.BuildError((byte)listType, responseInstanceValue, responseItemCode);
 
             return new UseStackableResponsePlan
             {
                 AckBody = ackBody,
                 ItemListUpdateBody = null,
                 StalePetConsumable = stalePetConsumable,
+                Accepted = consumed || stalePetConsumable,
             };
         }
 
@@ -301,6 +663,26 @@ namespace DfoServer.Network.Handlers
                 && slotIndex <= InventoryService.CreatureSlotEnd;
         }
 
+        // PVF stackable type 为 [unlimited ...]（如 [unlimited waste]）的道具可永久使用，
+        // 服务端不得扣减数量。
+        internal static bool IsUnlimitedUseStackable(int itemTemplateId)
+        {
+            if (itemTemplateId <= 0)
+                return false;
+
+            try
+            {
+                var metadata = ItemMetadataResolver.Resolve(itemTemplateId);
+                return metadata != null
+                    && metadata.IsStackable
+                    && metadata.IsPrimaryStackableFamily("unlimited");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         internal sealed class UseStackableResponsePlan
         {
             public byte[] AckBody { get; set; }
@@ -308,6 +690,10 @@ namespace DfoServer.Network.Handlers
             public byte[] ItemListUpdateBody { get; set; }
 
             public bool StalePetConsumable { get; set; }
+
+            public bool RefreshSourceSlot { get; set; }
+
+            public bool Accepted { get; set; }
         }
 
         public async Task Handle_OPEN_AVATAR_PACKAGE(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -605,7 +991,7 @@ namespace DfoServer.Network.Handlers
                     lease.Inventory,
                     request,
                     ResolveCharacterJobLabel(characterId),
-                    RejectingInventoryOverflowRewardSink.Instance,
+                    MailboxInventoryOverflowRewardSink.Instance,
                     out result);
             }
         }
@@ -627,7 +1013,7 @@ namespace DfoServer.Network.Handlers
                     lease.Inventory,
                     slotIndex,
                     selectedItemTemplateIds,
-                    RejectingInventoryOverflowRewardSink.Instance,
+                    MailboxInventoryOverflowRewardSink.Instance,
                     out result);
             }
         }
@@ -647,7 +1033,7 @@ namespace DfoServer.Network.Handlers
                 return InventorySpecialConsumableService.TryOpenAvatarPackage(
                     lease.Inventory,
                     request,
-                    RejectingInventoryOverflowRewardSink.Instance,
+                    MailboxInventoryOverflowRewardSink.Instance,
                     out result);
             }
         }
@@ -667,7 +1053,7 @@ namespace DfoServer.Network.Handlers
                 return InventorySpecialConsumableService.TryOpenSelectablePackage(
                     lease.Inventory,
                     request,
-                    RejectingInventoryOverflowRewardSink.Instance,
+                    MailboxInventoryOverflowRewardSink.Instance,
                     out result);
             }
         }
@@ -1273,19 +1659,20 @@ namespace DfoServer.Network.Handlers
 
             var respBody2 = w2.ToArray();
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x03EA, respBody2));
+            await _refresh.SendUpdateItemList(session, InventoryListType.Main, result.ConsumeSlot);
             FileLogger.Log($"  [CompoundAvatarSet] OK: consumed {consumeSlots.Length} avatar items + 1x slot {consumeStackableSlot}(template {result.ConsumedItemTemplateId}), abilityNo={option}, added item {result.NewItemIds[0]} at slot {result.NewSlots[0]}");
 
         }
 
         private static ushort ReadCompoundAvatarAbilityNo(byte[] body, int offset)
         {
-            if (body == null || body.Length < offset + 4)
+            if (body == null || body.Length < offset + 2)
                 return 0;
 
-            var value = BitConverter.ToInt32(body, offset);
+            var value = BitConverter.ToUInt16(body, offset);
             if (value <= 0)
                 return 0;
-            return value > ushort.MaxValue ? ushort.MaxValue : (ushort)value;
+            return value;
         }
 
         private static byte[] BuildCompoundAvatarErrorBody(bool includeTailByte)

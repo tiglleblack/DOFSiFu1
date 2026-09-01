@@ -1,6 +1,7 @@
 using DfoServer.Game.Characters;
 using DfoServer.Game.Quests;
 using DfoServer.Game.SelectCharacter;
+using DfoServer.GameWorld;
 using System;
 using System.Collections.Generic;
 
@@ -8,6 +9,11 @@ namespace DfoServer.Network.Builders
 {
     public static class SelectCharacterAckBodyBuilder
     {
+        public static byte[] BuildRejected(byte errorCode)
+        {
+            return CommonPacketBodyBuilder.BuildCmdError(errorCode);
+        }
+
         public static bool TryBuild(SelectCharacterDataSnapshot snapshot, out byte[] body)
         {
             var initSnap = snapshot.InitializationSnapshot;
@@ -56,7 +62,7 @@ namespace DfoServer.Network.Builders
             // u32 cera
             writer.WriteInt32(initSnap.AckCera);
 
-            // 30 × (u16 questId + u32 triggerValue) — active quest slots
+            // 30 x (u16 questId + u32 triggerValue) - fixed active quest slots
             List<ActiveQuest> activeQuests = null;
             if (record != null && record.CharacterId > 0)
             {
@@ -68,12 +74,17 @@ namespace DfoServer.Network.Builders
                 }
                 catch { }
             }
-            for (int i = 0; i < 30; i++)
+            var projectedActiveQuests = QuestDungeonPresentationPlanner
+                .ProjectActiveQuests(activeQuests);
+            var activeQuestSlots = QuestSlotLayout.ProjectFixedSlots(
+                projectedActiveQuests);
+            for (int i = 0; i < QuestSlotLayout.ActiveSlotCount; i++)
             {
-                if (activeQuests != null && i < activeQuests.Count)
+                var activeQuest = activeQuestSlots[i];
+                if (activeQuest != null)
                 {
-                    writer.WriteUInt16(activeQuests[i].QuestId);
-                    writer.WriteUInt32(activeQuests[i].TriggerValue);
+                    writer.WriteUInt16(activeQuest.QuestId);
+                    writer.WriteUInt32(activeQuest.TriggerValue);
                 }
                 else
                 {
@@ -82,9 +93,13 @@ namespace DfoServer.Network.Builders
                 }
             }
 
-            // ack_quest_display_ids: seed=16B all-zero
-            for (int j = 0; j < 16; j++)
-                writer.WriteByte(0);
+            // Four fixed int32 slots restored by CMD 0x01FB SAVE_QUEST_NOTIFY.
+            for (var index = 0; index < QuestNotifySelectionService.MaxSlots; index++)
+            {
+                writer.WriteInt32(index < initSnap.QuestNotifyIds.Count
+                    ? initSnap.QuestNotifyIds[index]
+                    : 0);
+            }
 
             writer.WriteByte(initSnap.AckCharSlotIndex);
 

@@ -2,6 +2,7 @@ using DfoServer.Game.Accounts;
 using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Currency;
+using DfoServer.Game.Dungeon;
 using DfoServer.Game.ExpertJob;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.ItemUpgrade;
@@ -23,14 +24,19 @@ namespace DfoServer.Game.SelectCharacter
         private readonly KnightShieldDeckRepository _knightShieldDeckRepository;
         private readonly SqliteUserInfoBlobRepository _userInfoBlobRepository;
         private readonly ICharacterStateRepository _initFlagsRepository;
+        private readonly IExpertJobStateRepository _expertJobStateRepository;
+        private readonly Quests.QuestNotifySelectionRepository _questNotifySelectionRepository;
         private readonly ICharacterRepository _characterRepository;
         private readonly AccountSettingsRepository _accountSettingsRepository;
         private readonly CharacterTitleBookRepository _titleBookRepository;
         private readonly DailyReset.DailyResetService _dailyResetService;
+        private readonly Quests.DailyChallengeService _dailyChallengeService;
         private readonly LotteryDoubleRewardPolicy _lotteryDoubleRewardPolicy;
         private readonly TitleBookMutationService _titleBookMutationService;
         private readonly HonorLevelSyncService _honorLevel;
         private readonly CharacterGoldLimitRepository _goldLimitRepository;
+        private readonly DungeonDifficultyPermissionService
+            _dungeonDifficultyPermissions;
         private readonly string _connectionString;
         private readonly string _databasePath;
         private readonly string _schemaFilePath;
@@ -49,6 +55,9 @@ namespace DfoServer.Game.SelectCharacter
             _connectionString = Infrastructure.SqliteDatabaseBootstrap.Initialize(databasePath, schemaFilePath);
             _rentalTimeProvider = rentalTimeProvider ?? SystemRentalTimeProvider.Instance;
             _dailyResetService = dailyResetService ?? new DailyReset.DailyResetService(databasePath, schemaFilePath);
+            _dailyChallengeService = new Quests.DailyChallengeService(
+                _connectionString,
+                _dailyResetService);
             _lotteryDoubleRewardPolicy = new LotteryDoubleRewardPolicy(
                 _dailyResetService,
                 _connectionString);
@@ -61,12 +70,20 @@ namespace DfoServer.Game.SelectCharacter
             _knightShieldDeckRepository = KnightShieldDeckRepository.FromConnectionString(_connectionString);
             _userInfoBlobRepository = new SqliteUserInfoBlobRepository(databasePath, schemaFilePath);
             _initFlagsRepository = new SqliteCharacterStateRepository(databasePath, schemaFilePath);
+            _expertJobStateRepository = new SqliteExpertJobStateRepository(
+                databasePath,
+                schemaFilePath);
+            _questNotifySelectionRepository = new Quests.QuestNotifySelectionRepository(_connectionString);
             _characterRepository = characterRepository;
             _accountSettingsRepository = new AccountSettingsRepository(databasePath, schemaFilePath);
             _titleBookRepository = new CharacterTitleBookRepository(_connectionString);
             _titleBookMutationService = new TitleBookMutationService(_connectionString);
             _honorLevel = new HonorLevelSyncService(_characterRepository);
             _goldLimitRepository = new CharacterGoldLimitRepository(databasePath, schemaFilePath);
+            _dungeonDifficultyPermissions =
+                new DungeonDifficultyPermissionService(
+                    databasePath,
+                    schemaFilePath);
         }
 
         public int GetSeedCharacterId()
@@ -126,6 +143,26 @@ namespace DfoServer.Game.SelectCharacter
             return result.Success;
         }
 
+        public IReadOnlyList<AchievementTriggerResult> TriggerUseItemAchievements(
+            int characterId,
+            int itemId,
+            int consumedCount)
+        {
+            return _titleBookMutationService.TriggerUseItemAchievements(
+                characterId,
+                itemId,
+                consumedCount);
+        }
+
+        public IReadOnlyList<AchievementTriggerResult> TriggerUseItemAchievements(
+            int characterId,
+            IEnumerable<KeyValuePair<int, int>> consumedItems)
+        {
+            return _titleBookMutationService.TriggerUseItemAchievements(
+                characterId,
+                consumedItems);
+        }
+
         public SelectCharacterDataSnapshot Load(int characterId, int accountId)
         {
             _inventoryLifecycle.DeleteExpiredRentalEquipment(characterId, accountId);
@@ -154,7 +191,25 @@ namespace DfoServer.Game.SelectCharacter
             SanitizeDarkKnightComboSkillInfo(initSnapshot);
             initSnapshot.CreatureItemList = LoadCreatureItemListSnapshot(characterId);
 
+            try
+            {
+                _dailyChallengeService.EnsureInitialized(characterId);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[SelectCharacterDataSource] daily challenge initialization failed "
+                    + $"cid={characterId}: {ex.Message}");
+            }
             _initFlagsRepository.LoadAll(characterId, initSnapshot);
+            var loginPermissions = _dungeonDifficultyPermissions
+                .BuildLoginPermissions(
+                    accountId,
+                    initSnapshot.DungeonPermissions);
+            initSnapshot.DungeonPermissions.Clear();
+            initSnapshot.DungeonPermissions.AddRange(loginPermissions);
+            initSnapshot.QuestNotifyIds.AddRange(
+                _questNotifySelectionRepository.Load(characterId));
             initSnapshot.TitleBookCategories.Clear();
             if (InventoryContext.TryGetLease(characterId, out var lease))
             {
@@ -217,7 +272,8 @@ namespace DfoServer.Game.SelectCharacter
                 var goldLimits = _goldLimitRepository.LoadOrCreate(characterId, character.Level);
                 initSnapshot.GoldLimitUpgradeLevel = goldLimits.UpgradeLevel;
             }
-            initSnapshot.MainGameOptionBlob = acctSettings?.MainGameOption ?? Settings.AccountSettings.DefaultMainGameOption;
+            initSnapshot.MainGameOptionBlob = (byte[])(acctSettings?.MainGameOption
+                ?? Settings.AccountSettings.DefaultMainGameOption).Clone();
             initSnapshot.QuickchatBank0 = acctSettings?.QuickchatBank0;
             initSnapshot.QuickchatBank1 = acctSettings?.QuickchatBank1;
             var hkSlots = initSnapshot.HotkeyConfigSlots.Count > 0
@@ -230,7 +286,6 @@ namespace DfoServer.Game.SelectCharacter
                 hkSlots = Settings.CharacterKeyboardDefaults.BuildHotkeySlots(character.Job);
                 _initFlagsRepository.SaveHotkeyConfig(characterId, hkSlots);
             }
-            Settings.AccountSettings.ApplyAccountScopedHotkeySlots(hkSlots, acctSettings?.HotkeySlots);
             if (hkSlots != null && hkSlots.Length >= 2)
             {
                 initSnapshot.HotkeyKeyType = character != null && Settings.CharacterKeyboardDefaults.IsCreatorMage(character.Job)
@@ -298,6 +353,23 @@ namespace DfoServer.Game.SelectCharacter
                     _databasePath, _schemaFilePath).Load(characterId);
                 if (tailSnap != null)
                     characterRecord.Subtype0Tail = tailSnap;
+
+                var expertJobType = characterRecord.Subtype0Tail?.ExpertJobType ?? 0;
+                var expertJobState = _expertJobStateRepository.Load(
+                    characterId,
+                    expertJobType);
+                ExpertJobStateCodec.ProjectToSnapshot(
+                    expertJobType,
+                    expertJobState,
+                    initSnapshot.ExpertJobInfo,
+                    characterRecord.Subtype0Tail?.ExpertJobExp ?? 0);
+
+                if (characterRecord.Subtype0Tail != null)
+                {
+                    Settings.AccountSettings.TryApplyCharacterVisibilityBitsToOptions(
+                        initSnapshot.MainGameOptionBlob,
+                        characterRecord.Subtype0Tail.UserStateBits);
+                }
 
                 
                 if (characterRecord.Subtype0Tail != null && initSnapshot.UserInfoAddition != null)

@@ -56,29 +56,50 @@ namespace DfoServer.Network.Handlers.Dungeon
         internal async Task HandleChangeTutorialFlag(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
             if (body.Length < 5) return;
+            var tutorialRun = session.Player.CurrentRun;
+            var tutorialRunIdentity = tutorialRun?.CaptureIdentity() ?? default;
             uint flagIndex = BitConverter.ToUInt32(body, 0);
             byte rewardFlag = body[4];
+            var activeCharacterId = session.Player.CharacterId;
+            var tutorialCharacterId = activeCharacterId > 0
+                ? activeCharacterId
+                : session.PendingReturnSelectCharacterId;
+            SelectCharacterInitializationSnapshot tutorialSnapshot = null;
+            var tutorialSkipAlreadySaved = false;
+            if (flagIndex == 31 && tutorialCharacterId > 0)
+            {
+                tutorialSnapshot = new SelectCharacterInitializationSnapshot();
+                _svc.CharacterStateRepository.LoadFlags(tutorialCharacterId, tutorialSnapshot);
+                tutorialSkipAlreadySaved = tutorialSnapshot.AckTutorialSkipable == 1;
+            }
 
-            FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] CHANGE_TUTORIAL_FLAG: flagIndex={flagIndex} rewardFlag={rewardFlag} dungeon={(session.Player.CurrentRun?.DungeonId ?? 0)} cid={session.Player.CharacterId}");
+            FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] CHANGE_TUTORIAL_FLAG: flagIndex={flagIndex} rewardFlag={rewardFlag} dungeon={(session.Player.CurrentRun?.DungeonId ?? 0)} cid={activeCharacterId} pendingCid={session.PendingReturnSelectCharacterId}");
 
             // RewardTutorial: PVF serverparameter.etc [escalade tutorial reward]
             var inserted = new List<(short slot, int itemId, int count)>();
-            if (rewardFlag != 0)
+            if (rewardFlag != 0 && !tutorialSkipAlreadySaved)
             {
-                var rewards = TutorialRewardProvider.GetRewards(flagIndex);
-                if (rewards != null)
+                if (flagIndex == 31 && activeCharacterId <= 0)
                 {
-                    foreach (var r in rewards)
+                    FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] RewardTutorial: flag=31 skipped because no active character is available after returning to selection");
+                }
+                else
+                {
+                    var rewards = TutorialRewardProvider.GetRewards(flagIndex);
+                    if (rewards != null)
                     {
-                        short slot;
-                        if (TryGrantTutorialReward(session, r.ItemId, r.Count, out slot))
+                        foreach (var r in rewards)
                         {
-                            inserted.Add((slot, r.ItemId, r.Count));
-                            FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] RewardTutorial: flag={flagIndex} gave item {r.ItemId} x{r.Count} -> slot {slot}");
-                        }
-                        else
-                        {
-                            FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] RewardTutorial: flag={flagIndex} FAILED to insert item {r.ItemId}");
+                            short slot;
+                            if (TryGrantTutorialReward(session, r.ItemId, r.Count, out slot))
+                            {
+                                inserted.Add((slot, r.ItemId, r.Count));
+                                FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] RewardTutorial: flag={flagIndex} gave item {r.ItemId} x{r.Count} -> slot {slot}");
+                            }
+                            else
+                            {
+                                FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] RewardTutorial: flag={flagIndex} FAILED to insert item {r.ItemId}");
+                            }
                         }
                     }
                 }
@@ -99,18 +120,33 @@ namespace DfoServer.Network.Handlers.Dungeon
             // flagIndex==31: tutorial complete -> return to town (only when in dungeon, df_game_r: state>1 + giveup_game)
             if (flagIndex == 31)
             {
-                var cid = session.Player.CharacterId;
-                FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] CHANGE_TUTORIAL_FLAG: tutorial complete (flag=31), marking skip. cid={cid}");
+                var cid = tutorialCharacterId;
+                FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] CHANGE_TUTORIAL_FLAG: tutorial complete (flag=31), marking skip. cid={cid} pendingCid={session.PendingReturnSelectCharacterId}");
 
-                var snap = new SelectCharacterInitializationSnapshot();
-                _svc.CharacterStateRepository.LoadFlags(cid, snap);
-                snap.AckTutorialSkipable = 1;
-                _svc.CharacterStateRepository.SaveFlags(cid, snap);
-
-                if ((session.Player.CurrentRun?.DungeonId ?? 0) > 0)
+                if (cid <= 0)
                 {
-                    FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] CHANGE_TUTORIAL_FLAG: returning to town from dungeon={(session.Player.CurrentRun?.DungeonId ?? 0)}");
-                    await ReturnToVillage(session);
+                    FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] CHANGE_TUTORIAL_FLAG: skip persist because no character context is available. pendingCid={session.PendingReturnSelectCharacterId}");
+                    return;
+                }
+
+                tutorialSnapshot ??= new SelectCharacterInitializationSnapshot();
+                if (tutorialSnapshot.AckTutorialSkipable != 1)
+                {
+                    tutorialSnapshot.AckTutorialSkipable = 1;
+                    _svc.CharacterStateRepository.SaveFlags(cid, tutorialSnapshot);
+                }
+                else
+                {
+                    FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] CHANGE_TUTORIAL_FLAG: tutorial skip already persisted. cid={cid}");
+                }
+
+                session.PendingReturnSelectCharacterId = 0;
+
+                if (tutorialRun != null
+                    && session.Player.IsCurrentDungeonRun(tutorialRunIdentity))
+                {
+                    FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] CHANGE_TUTORIAL_FLAG: returning to town from dungeon={tutorialRun.DungeonId}");
+                    await ReturnToVillage(session, tutorialRun);
                 }
             }
         }
@@ -120,9 +156,11 @@ namespace DfoServer.Network.Handlers.Dungeon
         // CalLevelUpItemState(1, targetLevel) bulk exp to target level, SendCmdOkPacket(484)
         internal async Task HandleTutorialLevelUp(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
-            FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] TUTORIAL_LEVEL_UP: cid={session.Player.CharacterId} level={session.Player.Level} dungeon={(session.Player.CurrentRun?.DungeonId ?? 0)}");
+            var run = session.Player.CurrentRun;
+            var runIdentity = run?.CaptureIdentity() ?? default;
+            FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] TUTORIAL_LEVEL_UP: cid={session.Player.CharacterId} level={session.Player.Level} dungeon={(run?.DungeonId ?? 0)}");
 
-            if (session.Player.Level != 1 || (session.Player.CurrentRun?.DungeonId ?? 0) <= 0)
+            if (session.Player.Level != 1 || run == null)
             {
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x01E4, new byte[] { 0x13 }));
                 return;
@@ -130,18 +168,22 @@ namespace DfoServer.Network.Handlers.Dungeon
 
             _svc.CharacterExperience.GrantToLevel(session.Player, TutorialTargetLevel, "tutorial");
 
-            var hasSkillPoints = _svc.TryGetSkillPointProtocolState(
+            var hasSkillPoints = _svc.ProgressNotifications.TryGetSkillPointProtocolState(
                 session, persist: true, logTag: "TUTORIAL_LEVEL_UP", out var skillPoints);
-            var honorLevel = _svc.ResolveHonorLevelForExp(session);
+            var honorLevel = _svc.ProgressNotifications.ResolveHonorLevelForExp(session);
 
             if (hasSkillPoints)
             {
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0025,
                     ExpNotificationBuilder.Build(
                         session.Player.Level, session.Player.Exp, skillPoints, honorLevel)));
+                if (!session.Player.IsCurrentDungeonRun(runIdentity))
+                    return;
             }
 
-            await _svc.SendInDungeonLevelUpFollowups(session);
+            await _svc.ProgressNotifications.SendInDungeonLevelUpFollowups(session);
+            if (!session.Player.IsCurrentDungeonRun(runIdentity))
+                return;
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x01E4, new byte[] { 0x01 }));
         }
@@ -149,30 +191,65 @@ namespace DfoServer.Network.Handlers.Dungeon
         internal async Task HandleBack2Village(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
             FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] BACK_2_VILLAGE: returning to town");
-            await ReturnToVillage(session);
+            await ReturnToVillage(session, session?.Player?.CurrentRun);
         }
 
-        private async Task ReturnToVillage(EnhancedClientSession session)
+        private async Task ReturnToVillage(
+            EnhancedClientSession session,
+            DungeonRun run)
         {
-            await DungeonRunLifecycle.EndRunToTownAsync(session);
+            var runIdentity = run?.CaptureIdentity() ?? default(DungeonRunIdentity);
+            if (run != null)
+            {
+                if (!await DungeonRunLifecycle.EndRunAsync(
+                        session,
+                        DungeonRunEndReason.TutorialExit,
+                        runIdentity,
+                        _svc.InstanceRegistry))
+                {
+                    return;
+                }
+            }
+            else
+            {
+                await DungeonRunLifecycle.EndRunAsync(
+                    session,
+                    DungeonRunEndReason.TutorialExit,
+                    instanceRegistry: _svc.InstanceRegistry);
+            }
+            if (run != null
+                && !DungeonRunLifecycle.CanProjectTownState(session, runIdentity))
+            {
+                return;
+            }
             session.Player.UserState = 0x00;
 
             var snapshot = TownAreaNotificationBuilder.CreateCurrentSnapshot(session.Player);
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0003,
                 EnterSelectDungeonStateBuilder.BuildUserState(session.Player)));
+            if (run != null && !DungeonRunLifecycle.CanProjectTownState(session, runIdentity))
+                return;
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0017,
                 TownAreaNotificationBuilder.BuildUserArea(snapshot)));
+            if (run != null && !DungeonRunLifecycle.CanProjectTownState(session, runIdentity))
+                return;
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0018,
                 TownAreaNotificationBuilder.BuildAreaUsers(snapshot)));
+            if (run != null && !DungeonRunLifecycle.CanProjectTownState(session, runIdentity))
+                return;
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x00CA,
                 new byte[] { 0x00 }));
-            await _svc.SendUserInfoSubtype0Broadcast(session);
+            if (run != null && !DungeonRunLifecycle.CanProjectTownState(session, runIdentity))
+                return;
+            await _svc.ProgressNotifications.SendUserInfoSubtype0Broadcast(session);
+            if (run != null && !DungeonRunLifecycle.CanProjectTownState(session, runIdentity))
+                return;
 
             FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] ReturnToVillage: town state + subtype0 sent");
         }
 
-        private static bool TryGrantTutorialReward(
+        private bool TryGrantTutorialReward(
             EnhancedClientSession session,
             int itemTemplateId,
             int stackCount,
@@ -190,17 +267,25 @@ namespace DfoServer.Network.Handlers.Dungeon
                     return false;
                 }
 
-                if (!InventoryRewardGrantService.TryCreateAndInsert(
+                var requests = new[]
+                {
+                    new DungeonItemGrantRequest
+                    {
+                        ItemTemplateId = itemTemplateId,
+                        Count = stackCount,
+                        Source = DungeonItemAcquisitionSource.TutorialReward,
+                    },
+                };
+                if (!_svc.ItemAcquisition.TryGrantItems(
                         lease,
-                        itemTemplateId,
-                        ItemCreateReason.QuestReward,
-                        stackCount,
-                        out var grant)
-                    || grant == null
-                    || !grant.Success)
+                        requests,
+                        out var grants)
+                    || grants.Entries.Count != 1
+                    || grants.Entries[0].Grant == null
+                    || !grants.Entries[0].Grant.Success)
                     return false;
 
-                assignedSlot = grant.SlotIndex;
+                assignedSlot = grants.Entries[0].Grant.SlotIndex;
                 return true;
             }
             catch (Exception ex)

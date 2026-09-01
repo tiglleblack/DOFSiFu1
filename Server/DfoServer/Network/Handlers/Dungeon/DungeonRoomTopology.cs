@@ -2,7 +2,6 @@ using DfoServer.Game.Dungeon;
 using PvfLib;
 using System;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace DfoServer.Network.Handlers.Dungeon
 {
@@ -36,9 +35,6 @@ namespace DfoServer.Network.Handlers.Dungeon
         private static readonly object MazeCacheLock = new object();
         private static readonly Dictionary<string, MazeInfo> MazeCache =
             new Dictionary<string, MazeInfo>(StringComparer.Ordinal);
-        private static readonly object PvfCoordinateCacheLock = new object();
-        private static readonly Dictionary<string, DungeonRoomPoint[]> PvfCoordinateCache =
-            new Dictionary<string, DungeonRoomPoint[]>(StringComparer.Ordinal);
 
         public static bool TryResolveMoveTarget(
             int dungeonId,
@@ -102,37 +98,27 @@ namespace DfoServer.Network.Handlers.Dungeon
             bool includePvfCoordinates = true)
         {
             var cells = new HashSet<DungeonRoomPoint>();
-            if (maze == null)
-                return cells;
-
-            AddGreedCells(maze, cells);
-
-            if (maze.MapSpecifications != null)
+            foreach (var coordinate in
+                GameWorld.DungeonMazeTopology.ResolveRoomCoordinates(
+                    dungeonId,
+                    mazeIndex,
+                    maze,
+                    includePvfCoordinates))
             {
-                foreach (var spec in maze.MapSpecifications)
-                    cells.Add(new DungeonRoomPoint(spec.X, spec.Y));
-            }
-
-            if (maze.StartMap != null && maze.StartMap.Length >= 2)
-                cells.Add(new DungeonRoomPoint(maze.StartMap[0], maze.StartMap[1]));
-            if (maze.BossMap != null && maze.BossMap.Length >= 2)
-            {
-                for (var i = 0; i + 1 < maze.BossMap.Length; i += 2)
-                    cells.Add(new DungeonRoomPoint(maze.BossMap[i], maze.BossMap[i + 1]));
-            }
-
-            if (includePvfCoordinates)
-            {
-                foreach (var coordinate in GetCachedPvfCoordinates(dungeonId, mazeIndex, maze))
-                {
-                    if (!IsWithinMazeBounds(maze, coordinate))
-                        continue;
-
-                    cells.Add(coordinate);
-                }
+                cells.Add(new DungeonRoomPoint(coordinate.X, coordinate.Y));
             }
 
             return cells;
+        }
+
+        internal static int CountConfiguredRooms(MazeInfo maze)
+        {
+            var count = BuildMazeCells(
+                dungeonId: 0,
+                mazeIndex: -1,
+                maze,
+                includePvfCoordinates: false).Count;
+            return Math.Max(1, count);
         }
 
         private static void AddBossCell(HashSet<DungeonRoomPoint> cells, int[] bossMapPos)
@@ -195,30 +181,6 @@ namespace DfoServer.Network.Handlers.Dungeon
             return true;
         }
 
-        private static IEnumerable<DungeonRoomPoint> GetCachedPvfCoordinates(
-            int dungeonId,
-            int mazeIndex,
-            MazeInfo maze)
-        {
-            var key = dungeonId.ToString() + ":" + mazeIndex.ToString();
-            lock (PvfCoordinateCacheLock)
-            {
-                if (PvfCoordinateCache.TryGetValue(key, out var cached))
-                    return cached;
-            }
-
-            var coordinates = GameWorld.Dungeon.GetDungeonRoomCoordinates(dungeonId, mazeIndex, maze)
-                .Select(coordinate => new DungeonRoomPoint(coordinate.X, coordinate.Y))
-                .ToArray();
-
-            lock (PvfCoordinateCacheLock)
-            {
-                PvfCoordinateCache[key] = coordinates;
-            }
-
-            return coordinates;
-        }
-
         private static MazeInfo GetCachedMaze(int dungeonId, int mazeIndex)
         {
             var key = dungeonId.ToString() + ":" + mazeIndex.ToString();
@@ -237,43 +199,24 @@ namespace DfoServer.Network.Handlers.Dungeon
             return maze;
         }
 
-        private static bool IsWithinMazeBounds(MazeInfo maze, DungeonRoomPoint point)
+        internal static DungeonRoomProgress GetCurrentRoomProgress(EnhancedClientSession session)
         {
-            if (maze.Width <= 0 || maze.Height <= 0)
-                return true;
-
-            return point.X >= 0 && point.Y >= 0 && point.X < maze.Width && point.Y < maze.Height;
-        }
-
-        private static void AddGreedCells(MazeInfo maze, HashSet<DungeonRoomPoint> cells)
-        {
-            if (maze.Width <= 0 || maze.Height <= 0 || string.IsNullOrWhiteSpace(maze.Greed))
-                return;
-
-            var values = maze.Greed
-                .Where(ch => !char.IsWhiteSpace(ch) && ch != '`' && ch != ',')
-                .ToArray();
-            if (values.Length < maze.Width * maze.Height)
-                return;
-
-            for (var y = 0; y < maze.Height; y++)
+            var run = session?.Player?.CurrentRun;
+            if (run != null && run.Tower == null)
             {
-                for (var x = 0; x < maze.Width; x++)
+                RoomState roomState;
+                lock (run.SyncRoot)
+                    run.RoomStates.TryGetValue(run.RoomKey, out roomState);
+                if (roomState?.InstanceRoom != null)
                 {
-                    var ch = values[y * maze.Width + x];
-                    if (IsOpenGreedCell(ch))
-                        cells.Add(new DungeonRoomPoint(x, y));
+                    return GetRoomProgress(
+                        session,
+                        roomState.InstanceRoom.CaptureKilledActorSequenceIds());
                 }
             }
-        }
 
-        private static bool IsOpenGreedCell(char ch)
-        {
-            return ch != '0' && ch != '.' && ch != 'x' && ch != 'X';
+            return GetRoomProgress(session, run?.RoomKilledSeqIds);
         }
-
-        internal static DungeonRoomProgress GetCurrentRoomProgress(EnhancedClientSession session)
-            => GetRoomProgress(session, session?.Player?.CurrentRun?.RoomKilledSeqIds);
 
         internal static DungeonRoomProgress GetRoomProgress(
             EnhancedClientSession session,
@@ -291,7 +234,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             for (var i = 0; i < monsters.Count; i++)
             {
                 var monster = monsters[i];
-                if (monster.Type == 9) continue;
+                if (!IsTrackedForRoomProgress(monster.Type)) continue;
 
                 trackable++;
                 if (monster.Type >= 5) apc++; else normal++;
@@ -342,6 +285,51 @@ namespace DfoServer.Network.Handlers.Dungeon
                     killedBlockingCount++;
             }
             return killedBlockingCount >= blockingCount;
+        }
+
+        internal static bool IsTrackedForRoomProgress(byte actorType) =>
+            actorType != 9;
+
+        internal static bool TryCommitCurrentRoomClear(
+            Game.Dungeon.DungeonRun run,
+            DungeonEventEnvelope source,
+            ushort completingSequenceId,
+            out int blockingCount,
+            out int killedBlockingCount,
+            out DungeonEventEnvelope clearSource)
+        {
+            blockingCount = 0;
+            killedBlockingCount = 0;
+            clearSource = null;
+            if (run == null || source == null)
+                return false;
+
+            RoomState roomState;
+            lock (run.SyncRoot)
+                run.RoomStates.TryGetValue(run.RoomKey, out roomState);
+
+            if (run.Tower == null && roomState?.InstanceRoom != null)
+            {
+                var commit = roomState.InstanceRoom.TryCommitClearFromActorDeaths(
+                    actor => IsBlockingForRoomClear(run, actor),
+                    source,
+                    completingSequenceId);
+                blockingCount = commit.BlockingCount;
+                killedBlockingCount = commit.KilledBlockingCount;
+                clearSource = commit.Source;
+                return commit.IsCleared;
+            }
+
+            lock (run.SyncRoot)
+            {
+                var cleared = ComputeRoomClearedLocked(
+                    run,
+                    out blockingCount,
+                    out killedBlockingCount);
+                if (cleared)
+                    clearSource = source;
+                return cleared;
+            }
         }
 
         private static bool IsBlockingForRoomClear(

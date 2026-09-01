@@ -1,4 +1,5 @@
 using DfoServer.Game.Currency;
+using DfoServer.Game.Dungeon;
 using DfoServer.Game.Inventory;
 using DfoServer.Network.Builders;
 using System;
@@ -14,6 +15,23 @@ namespace DfoServer.Network.Handlers
             if (body == null || body.Length < 4)
                 return;
 
+            if (TryBuildDungeonDeleteItemResponsePlan(
+                    session?.Player?.CurrentRun?.RewardPolicy,
+                    body,
+                    out var rejectionBody,
+                    out var rejectedListType))
+            {
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01,
+                    0x0012,
+                    rejectionBody));
+                FileLogger.Log(
+                    $"[{ProtocolName}] DELETE_ITEM training rejected: " +
+                    $"cid={session?.Player?.CharacterId ?? 0} " +
+                    $"listType={rejectedListType}");
+                return;
+            }
+
             var (cid, _) = ResolveOwner(session);
             var hasInventoryLease = TryGetOwnedInventoryLease(session, cid, out var lease);
 
@@ -23,11 +41,13 @@ namespace DfoServer.Network.Handlers
                 var listType = (InventoryListType)body[0];
                 var arrayCount = body[1];
                 var offset = 2;
+                var mutations = new List<InventoryMutationResult>();
+                var skillMaterialConsumption = new List<KeyValuePair<int, int>>();
 
                 // Entry (12B): opType(u16) + slotIndex(u16) + itemId(i32) + deleteCount(i32)
                 for (int i = 0; i < arrayCount && offset + 12 <= body.Length; i++)
                 {
-                    var opType = BitConverter.ToInt16(body, offset);
+                    var opType = BitConverter.ToUInt16(body, offset);
                     var slotIndex = BitConverter.ToInt16(body, offset + 2);
                     var itemId = BitConverter.ToInt32(body, offset + 4);
                     var deleteCount = (short)BitConverter.ToInt32(body, offset + 8);
@@ -49,14 +69,49 @@ namespace DfoServer.Network.Handlers
                     if (!deleted)
                     {
                         FileLogger.Log($"[{ProtocolName}] DELETE_ITEM(ext): failed at listType={listType} slot={slotIndex} count={deleteCount}");
-                        var errAck = new byte[] { 0x00, 0x17, (byte)listType };
+                        var errAck = DeleteItemAckBuilder.BuildError((byte)listType);
                         await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0012, errAck));
                         continue;
                     }
 
+                    var actualDeletedCount = Math.Max(0, (int)result.AppliedCount);
                     result.AppliedCount = deleteCount;
                     await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0012, DeleteItemAckBuilder.Build(result)));
-                    FileLogger.Log($"[{ProtocolName}] DELETE_ITEM(ext): slot={slotIndex} item=0x{itemId:X8} applied={deleteCount} remaining={result.RemainingStackCount}");
+                    mutations.Add(result);
+                    // operationType > 1 is the client wire marker for skill-material
+                    // consumption (the same rule is used by Death Tower inventory).
+                    // Manual discard and other DELETE_ITEM traffic must not advance
+                    // title-book [use item] achievements.
+                    if (IsSkillMaterialDeleteOperation(opType)
+                        && actualDeletedCount > 0)
+                    {
+                        skillMaterialConsumption.Add(
+                            new KeyValuePair<int, int>(
+                                result.ItemTemplateId,
+                                actualDeletedCount));
+                    }
+                    FileLogger.Log($"[{ProtocolName}] DELETE_ITEM(ext): op={opType} slot={slotIndex} item=0x{itemId:X8} applied={deleteCount} remaining={result.RemainingStackCount}");
+                }
+
+                if (hasInventoryLease
+                    && mutations.Count > 0
+                    && session.GameSession?.QuestManager != null)
+                {
+                    session.GameSession.QuestManager
+                        .RecalibrateItemSeekingQuestProgressAfterInventoryMutationsWithoutNotification(
+                            lease,
+                            mutations);
+                }
+
+                if (skillMaterialConsumption.Count > 0)
+                {
+                    var achievementResults =
+                        _sqliteSelectCharacterDataSource.TriggerUseItemAchievements(
+                            cid,
+                            skillMaterialConsumption);
+                    _titleBookAchievementProgressBatcher.Queue(
+                        session,
+                        achievementResults);
                 }
                 return;
             }
@@ -80,12 +135,48 @@ namespace DfoServer.Network.Handlers
 
             if (!simpleDeleted)
             {
-                var errAck = new byte[] { 0x00, 0x17, (byte)lt };
+                var errAck = DeleteItemAckBuilder.BuildError((byte)lt);
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0012, errAck));
                 return;
             }
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0012, DeleteItemAckBuilder.Build(simpleResult)));
+            if (hasInventoryLease && session.GameSession?.QuestManager != null)
+            {
+                session.GameSession.QuestManager
+                    .RecalibrateItemSeekingQuestProgressAfterInventoryMutationWithoutNotification(
+                        lease,
+                        simpleResult);
+            }
+        }
+
+        internal static bool TryBuildDungeonDeleteItemResponsePlan(
+            DungeonRewardPolicy rewardPolicy,
+            byte[] body,
+            out byte[] rejectionBody,
+            out InventoryListType listType)
+        {
+            rejectionBody = null;
+            listType = InventoryListType.Main;
+            if (body == null
+                || body.Length < 4
+                || DungeonInteractionPolicy.Resolve(rewardPolicy)
+                    .AllowsItemDiscard)
+            {
+                return false;
+            }
+
+            listType = body.Length >= 15
+                ? (InventoryListType)body[0]
+                : TryParseDeleteOrSellRequest(
+                    body,
+                    out var parsedListType,
+                    out _,
+                    out _)
+                    ? parsedListType
+                    : InventoryListType.Main;
+            rejectionBody = DeleteItemAckBuilder.BuildError((byte)listType);
+            return true;
         }
 
         public async Task Handle_ENUM_CMDPACKET_BUY_ITEM(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -151,6 +242,14 @@ namespace DfoServer.Network.Handlers
                 await _refresh.SendUpdateItemList(session, result.ListType, result.SlotIndex);
                 FileLogger.Log($"[{ProtocolName}] BUY_ITEM: ITEM_LIST update sent list={result.ListType} slot={result.SlotIndex}");
             }
+
+            if (session.GameSession?.QuestManager != null)
+            {
+                await session.GameSession.QuestManager
+                    .SyncItemSeekingQuestProgressAfterInventoryMutationAsync(
+                        lease,
+                        result);
+            }
         }
 
         public async Task Handle_ENUM_CMDPACKET_SELL_ITEM(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -211,6 +310,13 @@ namespace DfoServer.Network.Handlers
 
             FileLogger.Log($"[{ProtocolName}] SELL_ITEM: OK gold={result.UpdatedGold} applied={result.AppliedCount}");
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0016, SellItemBuilder.Build((byte)listType, result.SlotIndex, result.AppliedCount, result.UpdatedGold)));
+            if (session.GameSession?.QuestManager != null)
+            {
+                session.GameSession.QuestManager
+                    .RecalibrateItemSeekingQuestProgressAfterInventoryMutationWithoutNotification(
+                        lease,
+                        result);
+            }
         }
 
         public async Task Handle_SET_CLONE_TITLE(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -317,13 +423,27 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
-            var w = new GamePacketWriter();
-            w.WriteByte(1);
-            w.WriteInt32(result.QuestId);
-            w.WriteUInt16(result.Remain1);
-            w.WriteUInt16(result.Remain2);
-            w.WriteUInt16(result.Remain3);
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, header.type, w.ToArray()));
+            if (!SaveTitleBookMutation(session, cid))
+                FileLogger.Log($"[{ProtocolName}] ACHIEVEMENT_TRIGGER: SaveDirty failed cid={cid} quest={questId}");
+
+            await SendAchievementTriggerResult(session, cid, result);
+        }
+
+        private async Task SendAchievementTriggerResult(
+            EnhancedClientSession session,
+            int characterId,
+            Game.TitleBook.AchievementTriggerResult result)
+        {
+            var progress = new GamePacketWriter();
+            progress.WriteByte(1);
+            progress.WriteInt32(result.QuestId);
+            progress.WriteUInt16(result.Remain1);
+            progress.WriteUInt16(result.Remain2);
+            progress.WriteUInt16(result.Remain3);
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x01,
+                0x01A1,
+                progress.ToArray()));
 
             if (result.Completed && result.TitleItemId > 0)
             {
@@ -334,9 +454,50 @@ namespace DfoServer.Network.Handlers
                 complete.WriteInt32(result.TitleItemId);
                 complete.WriteUInt16((ushort)Math.Max(0, result.BookIndex));
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0168, complete.ToArray()));
-                await SendTitleBookCategoryRefresh(session, cid, result.Category);
+                await SendTitleBookCategoryRefresh(session, characterId, result.Category);
             }
         }
+
+        private async Task FlushUseItemAchievementProgressAsync(
+            EnhancedClientSession session,
+            int characterId,
+            IReadOnlyList<Game.TitleBook.AchievementTriggerResult> results)
+        {
+            if (session?.Player == null
+                || session.Player.CharacterId != characterId
+                || results == null
+                || results.Count == 0)
+            {
+                return;
+            }
+
+            var completed = false;
+            foreach (var result in results)
+                completed |= result.Completed;
+
+            // Ordinary progress remains dirty in the shared online inventory and is
+            // persisted together with the item deduction by the existing periodic /
+            // disconnect save. Only completion is forced immediately so the awarded
+            // title and the zero remainder commit atomically before notification.
+            if (completed && !SaveTitleBookMutation(session, characterId))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] ACHIEVEMENT_USE_ITEM: " +
+                    $"completion SaveDirty failed cid={characterId}");
+            }
+
+            foreach (var result in results)
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] ACHIEVEMENT_USE_ITEM: cid={characterId} " +
+                    $"quest={result.QuestId} remain={result.Remain1} " +
+                    $"completed={result.Completed}");
+                await SendAchievementTriggerResult(session, characterId, result);
+            }
+        }
+
+        internal static bool IsSkillMaterialDeleteOperation(ushort operationType)
+            => operationType > 1;
 
         private static byte[] BuildTitleBookSuccess(int itemSpace, short slot, int category, int index)
         {
@@ -413,14 +574,26 @@ namespace DfoServer.Network.Handlers
 
             var (cid, _) = ResolveOwner(session);
             int newCharGold, newCargoGold;
+            InventoryMutationResult mutation;
+            InventoryLease lease;
             bool ok;
-            if (TryGetOwnedInventoryLease(session, cid, out var lease))
+            if (TryGetOwnedInventoryLease(session, cid, out lease))
             {
                 lock (lease.SyncRoot)
                 {
                     ok = isDeposit
-                        ? InventoryCargoRuntimeService.TryDepositCargoGold(lease.Inventory, amount, out newCharGold, out newCargoGold)
-                        : InventoryCargoRuntimeService.TryWithdrawCargoGold(lease.Inventory, amount, out newCharGold, out newCargoGold);
+                        ? InventoryCargoRuntimeService.TryDepositCargoGold(
+                            lease.Inventory,
+                            amount,
+                            out newCharGold,
+                            out newCargoGold,
+                            out mutation)
+                        : InventoryCargoRuntimeService.TryWithdrawCargoGold(
+                            lease.Inventory,
+                            amount,
+                            out newCharGold,
+                            out newCargoGold,
+                            out mutation);
                 }
             }
             else
@@ -428,6 +601,7 @@ namespace DfoServer.Network.Handlers
                 ok = false;
                 newCharGold = 0;
                 newCargoGold = 0;
+                mutation = null;
             }
             if (!ok)
             {
@@ -441,6 +615,13 @@ namespace DfoServer.Network.Handlers
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, wireType, ack.ToArray()));
 
             await _refresh.SendGoldUpdate(session);
+            if (session.GameSession?.QuestManager != null)
+            {
+                await session.GameSession.QuestManager
+                    .SyncItemSeekingQuestProgressAfterInventoryMutationAsync(
+                        lease,
+                        mutation);
+            }
 
             FileLogger.Log($"[{ProtocolName}] {(isDeposit ? "DEPOSIT" : "WITHDRAW")}_MONEY: amount={amount} charGold={newCharGold} cargoGold={newCargoGold}");
         }

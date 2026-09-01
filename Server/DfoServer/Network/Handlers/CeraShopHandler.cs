@@ -24,6 +24,21 @@ namespace DfoServer.Network.Handlers
             _refresh = refresh;
         }
 
+        public Task HandleGenCeraTicket(EnhancedClientSession session, GamePacketHeader header, byte[] body)
+        {
+            // 从台服借来的数据包 `Dispatcher_GenCeraTicket::dispatch_sig`
+            // 只能防止客户端卡住，同时还有一个副作用，会让鼠标消失，只要将鼠标移动到邮箱等会让指针变化的地方就会再出现
+            var writer = new GamePacketWriter();
+            writer.WriteByte(1);
+            var now = DateTime.UtcNow;
+            var ts = new DateTimeOffset(now).ToUnixTimeSeconds();
+            var s = $"1234{ts:D10}00000";
+            writer.WriteUtf8Dstr(s);
+            writer.WriteUInt32(123456);
+            return session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, header.type, writer.ToArray()));
+        }
+
+
         public async Task HandleCeraShopPurchase(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
             FileLogger.Log($"[{ProtocolName}] CERA_SHOP_BUY raw body({body?.Length ?? 0}): {(body != null ? BitConverter.ToString(body) : "null")}");
@@ -34,7 +49,7 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
-            FileLogger.Log($"[{ProtocolName}] CERA_SHOP_BUY parsed: {request.CommodityNos.Count} item(s) [{string.Join(", ", request.CommodityNos)}] paymentMode={request.PaymentMode}");
+            FileLogger.Log($"[{ProtocolName}] CERA_SHOP_BUY parsed: {request.CommodityNos.Count} item(s) [{string.Join(", ", request.CommodityNos)}] paymentMode={request.PaymentMode} coupon={(request.CouponSelected ? $"0x{request.CouponItemId:X8}@{request.CouponSlot}" : "none")}");
             var cid = session.Player?.CharacterId ?? 0;
             var aid = session.Account?.AccountId ?? 0;
             if (cid <= 0 || aid <= 0)
@@ -56,15 +71,19 @@ namespace DfoServer.Network.Handlers
             var contractItems = new List<(int itemTemplateId, int count)>();
             var skillTreeExpansionUnlocked = false;
             var runtimeInventoryDirty = false;
+            var failure = CeraShopPurchaseFailure.Unknown;
 
             for (var idx = 0; idx < request.CommodityNos.Count; idx++)
             {
                 var commodityNo = request.CommodityNos[idx];
                 var attrValue = idx < request.AttributeValues.Count ? request.AttributeValues[idx] : (byte)0;
+                var itemOptions = idx < request.ItemOptions.Count ? request.ItemOptions[idx] : null;
 
-                var (dcOk, dcResult) = await Game.Premium.PremiumService.TryBuyDevilContractSlot(
+                var (dcOk, dcResult) = await Game.Premium.PremiumService.TryBuyDevilContract(
                     session,
                     commodityNo,
+                    request.PaymentMode,
+                    request.CouponSelected,
                     _sqliteSelectCharacterDataSource);
                 if (dcOk)
                 {
@@ -74,6 +93,7 @@ namespace DfoServer.Network.Handlers
                 }
 
                 InventoryMutationResult result;
+                CeraShopPurchaseFailure itemFailure;
                 bool handledByRuntime;
                 bool ok;
                 lock (lease.SyncRoot)
@@ -85,7 +105,11 @@ namespace DfoServer.Network.Handlers
                         1,
                         request.PaymentMode,
                         attrValue,
+                        request.CouponSelected ? request.CouponItemId : 0,
+                        request.CouponSelected ? request.CouponSlot : (short)-1,
+                        itemOptions,
                         out result,
+                        out itemFailure,
                         out handledByRuntime);
                 }
 
@@ -99,19 +123,43 @@ namespace DfoServer.Network.Handlers
                 }
                 else
                 {
-                    FileLogger.Log($"[{ProtocolName}] CERA_SHOP_BUY: FAILED commodityNo={commodityNo}");
+                    if (itemFailure == CeraShopPurchaseFailure.InsufficientCera)
+                        failure = itemFailure;
+                    FileLogger.Log($"[{ProtocolName}] CERA_SHOP_BUY: FAILED commodityNo={commodityNo} avatarChoices={itemOptions?.AvatarChoices.Count ?? 0} selections={itemOptions?.SelectionChoices.Count ?? 0}");
                 }
             }
 
             if (results.Count == 0)
             {
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0040, CeraShopPurchaseAckBuilder.BuildError(request)));
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01,
+                    0x0040,
+                    CeraShopPurchaseAckBuilder.BuildError(ResolvePurchaseErrorCode(failure), request)));
                 return;
             }
 
             var last = results[results.Count - 1];
             if (runtimeInventoryDirty && !InventoryPersistenceService.SaveDirty(lease))
                 FileLogger.Log($"[{ProtocolName}] CERA_SHOP_BUY: SaveDirty failed cid={cid} aid={aid}");
+
+            var refreshAvatarInventory = false;
+            foreach (var result in results)
+            {
+                foreach (var updateResult in EnumerateResultGroup(result))
+                {
+                    if (updateResult.ConsumedOnPurchase
+                        && updateResult.ListType == InventoryListType.Avatar)
+                        refreshAvatarInventory = true;
+                }
+            }
+
+            // The cera-shop success handler rebuilds its visible product list immediately.
+            // Publish the new avatar expansion value first so that rebuild selects the next stage.
+            if (refreshAvatarInventory)
+            {
+                await SendItemListRefresh(session, cid, aid, InventoryListType.Avatar);
+                FileLogger.Log($"[{ProtocolName}] CERA_SHOP_BUY: avatar inventory expansion ITEM_LIST refresh sent before purchase ACK");
+            }
 
             foreach (var item in successItems)
             {
@@ -124,10 +172,14 @@ namespace DfoServer.Network.Handlers
             var refreshSlots = new Dictionary<InventoryListType, HashSet<short>>();
             var refreshAccountCargo = false;
             var refreshPersonalCargo = false;
+            var mailboxAlarmNeeded = false;
             foreach (var result in results)
             {
                 foreach (var updateResult in EnumerateResultGroup(result))
                 {
+                    if (updateResult.DeliveredByMail)
+                        mailboxAlarmNeeded = true;
+
                     if (updateResult.ConsumedOnPurchase)
                     {
                         if (updateResult.ListType == InventoryListType.AccountCargo)
@@ -170,6 +222,15 @@ namespace DfoServer.Network.Handlers
             }
 
             await SendQueuedItemListUpdates(session, refreshSlots);
+
+            if (mailboxAlarmNeeded)
+            {
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x00,
+                    (ushort)NotiPacketType.MAILBOX_ALARM,
+                    MailboxHandler.BuildMailboxAlarmNotification(1)));
+                FileLogger.Log($"[{ProtocolName}] CERA_SHOP_BUY: mailbox alarm sent for overflow rewards");
+            }
 
             if (_refresh != null && results.Exists(r => r.NameTagEquipped))
             {
@@ -218,6 +279,13 @@ namespace DfoServer.Network.Handlers
                 0x00,
                 0x000D,
                 ItemListPacketBuilder.BuildBody(characterId, accountId, listType)));
+        }
+
+        private static byte ResolvePurchaseErrorCode(CeraShopPurchaseFailure failure)
+        {
+            return failure == CeraShopPurchaseFailure.InsufficientCera
+                ? CeraShopPurchaseAckBuilder.ErrorCodeInsufficientCera
+                : CeraShopPurchaseAckBuilder.ErrorCodeInventoryFull;
         }
 
         private async Task SendQueuedItemListUpdates(

@@ -87,6 +87,14 @@ namespace PvfLib
         public List<int> Values { get; set; } = new List<int>();
     }
 
+    public sealed class AvatarSelectAbilityChangeEntry
+    {
+        public string SourceScope { get; set; }
+        public string TargetScope { get; set; }
+        public int AvatarGrade { get; set; } = -1;
+        public int Param { get; set; } = -1;
+    }
+
     public sealed class EquipmentLevelEmancipateProbability
     {
         public int MaximumLevel { get; set; }
@@ -106,6 +114,34 @@ namespace PvfLib
         public int UpgradeLevel { get; set; } = -1;
         public EquipmentLevelEmancipateCondition Condition { get; set; } = new EquipmentLevelEmancipateCondition();
         public List<int> IgnoreIndexes { get; set; } = new List<int>();
+    }
+
+    public sealed class LimitedCubeItemRequirement
+    {
+        public int ItemId { get; set; }
+
+        public int Count { get; set; }
+    }
+
+    public sealed class LimitedCubeResultEntry
+    {
+        public int ItemId { get; set; }
+
+        public short ResultValue { get; set; }
+
+        public int Weight { get; set; }
+    }
+
+    public sealed class UpgradeLimitCubeInfo
+    {
+        public List<LimitedCubeItemRequirement> ConditionItems { get; } =
+            new List<LimitedCubeItemRequirement>();
+
+        public List<LimitedCubeItemRequirement> AdditionalMaterials { get; } =
+            new List<LimitedCubeItemRequirement>();
+
+        public List<LimitedCubeResultEntry> Results { get; } =
+            new List<LimitedCubeResultEntry>();
     }
 
     
@@ -133,6 +169,8 @@ namespace PvfLib
         public List<string> AvatarEmblemTargetTypes { get; set; } = new List<string>();
         // [usable equip type] 限定可作用的装备部位, 例如品级调整箱按武器/防具/首饰分箱。空表示不限部位。
         public List<string> UsableEquipTypes { get; set; } = new List<string>();
+        public List<AvatarSelectAbilityChangeEntry> AvatarSelectAbilityChanges { get; set; } = new List<AvatarSelectAbilityChangeEntry>();
+        public bool HasAvatarSelectAbilityChange => AvatarSelectAbilityChanges.Count > 0;
         public byte AvatarEmblemSocketType { get; set; }
         public int SubType { get; set; } = -1;
         public string AttachType { get; set; }
@@ -176,6 +214,11 @@ namespace PvfLib
         public int UsablePeriod { get; set; } = -1;
         public int TradeLimit { get; set; } = -1;
         public int PortableDisjoint { get; set; } = -1;
+        public string ExpertJobOnlyType { get; set; }
+        public int ExpertJobOnlyLevel { get; set; } = -1;
+        public int AlchemistExtractionIndex { get; set; } = -1;
+        public int EnchanterExtractionIndex { get; set; } = -1;
+        public int DollControllerExtractionIndex { get; set; } = -1;
 
         #endregion
 
@@ -188,8 +231,10 @@ namespace PvfLib
         // [action type] `[xxx]` p1 p2 ...: ActionTypeName="[xxx]", ActionTypeParams=[p1,p2,...]
         public string ActionTypeName { get; set; }
         public List<int> ActionTypeParams { get; set; } = new List<int>();
+        public UpgradeLimitCubeInfo UpgradeLimitCube { get; set; }
         public EquipmentUpgradeTicketInfo EquipmentReinforcementTicket { get; set; }
         public EquipmentUpgradeTicketInfo EquipmentAmplifyReinforcementTicket { get; set; }
+        public EquipmentUpgradeTicketInfo EquipmentSeparateReinforcementTicket { get; set; }
         public EnchantRandomUpgradeInfo EnchantRandomUpgrade { get; set; }
         public List<AmplificationRandomValueEntry> AmplificationRandomValues { get; set; } = new List<AmplificationRandomValueEntry>();
         public List<int> CheckUsableItemLevels { get; set; } = new List<int>();
@@ -224,6 +269,7 @@ namespace PvfLib
         public string PackageData { get; set; }
         public List<BoosterRewardEntry> PackageRewards { get; set; } = new List<BoosterRewardEntry>();
         public List<BoosterRewardEntry> RandomBoxRewards { get; set; } = new List<BoosterRewardEntry>();
+        public List<BoosterRewardEntry> LegacyRewards { get; set; } = new List<BoosterRewardEntry>();
         public List<BoosterRewardEntry> UpgradableLegacyRewards { get; set; } = new List<BoosterRewardEntry>();
         public List<RandomBoxRemovalItemEntry> RandomBoxRemovalItems { get; set; } = new List<RandomBoxRemovalItemEntry>();
         public string OutputItem { get; set; }
@@ -231,7 +277,10 @@ namespace PvfLib
         public string NeedSkill { get; set; }
         public string NeedMaterial { get; set; }
         public int MonsterCardId { get; set; } = -1;
+        public List<int> MonsterCardIds { get; set; } = new List<int>();
+        public int MonsterCardBind { get; set; } = -1;
         public List<int> TargetItemIds { get; set; } = new List<int>();
+        public List<int> BeadLimitedUsableItemIds { get; set; } = new List<int>();
 
         #endregion
 
@@ -275,6 +324,7 @@ namespace PvfLib
                         stk.AvatarEmblemSocketType = ResolveAvatarEmblemSocketType(stk.AvatarEmblemTargetTypes);
                         break;
                     case "usable equip type": stk.UsableEquipTypes = ParseStringList(node, content); break;
+                    case "avatar select ability change": stk.AvatarSelectAbilityChanges = ParseAvatarSelectAbilityChanges(node, content); break;
                     case "sub type": stk.SubType = ParseInt(data); break;
                     case "attach type": stk.AttachType = StripBacktick(data); break;
                     case "item group name": stk.ItemGroupName = StripBacktick(data); break;
@@ -317,6 +367,10 @@ namespace PvfLib
                     case "usable period": stk.UsablePeriod = ParseInt(data); break;
                     case "trade limit max": stk.TradeLimit = ParseInt(data); break;
                     case "portable disjoint": stk.PortableDisjoint = ParseInt(data); break;
+                    case "expertjob only": ParseExpertJobOnly(node, content, stk); break;
+                    case "alchemist extraction": stk.AlchemistExtractionIndex = ParseInt(data); break;
+                    case "enchanter extraction": stk.EnchanterExtractionIndex = ParseInt(data); break;
+                    case "doll_controller extraction": stk.DollControllerExtractionIndex = ParseInt(data); break;
 
                     
                     case "enchant index": stk.EnchantIndex = ParseInt(data); break;
@@ -324,8 +378,10 @@ namespace PvfLib
                     case "3choro enchant": stk.ThreeChronicleEnchant = ParseThreeChronicleEnchant(root, node, content); break;
                     case "enchant table": stk.EnchantTable = ParseEnchantTableIndexes(node, content); break;
                     case "action type": ParseActionType(node, content, stk); break;
+                    case "upgrade limit cube info": stk.UpgradeLimitCube = ParseUpgradeLimitCubeInfo(node, content); break;
                     case "equipment reinforcement ticket": stk.EquipmentReinforcementTicket = ParseUpgradeTicket(node, content); break;
                     case "equipment amplify reinforcement ticket": stk.EquipmentAmplifyReinforcementTicket = ParseUpgradeTicket(node, content); break;
+                    case "equipment separate reinforcement ticket": stk.EquipmentSeparateReinforcementTicket = ParseUpgradeTicket(node, content); break;
                     case "enchant random": stk.EnchantRandomUpgrade = ParseEnchantRandomUpgrade(node, content); break;
                     case "amplification random value": stk.AmplificationRandomValues = ParseAmplificationRandomValues(node, content); break;
                     case "check usable itemlevel": stk.CheckUsableItemLevels = ParseIntList(node, content); break;
@@ -355,8 +411,15 @@ namespace PvfLib
                     case "input item": stk.InputItem = data; break;
                     case "need skill": stk.NeedSkill = data; break;
                     case "need material": stk.NeedMaterial = data; break;
-                    case "monster card id": stk.MonsterCardId = ParseInt(data); break;
+                    case "monster card id":
+                    {
+                        stk.MonsterCardIds = ParseIntList(node, content);
+                        stk.MonsterCardId = ResolveFirstPositive(stk.MonsterCardIds, ParseInt(data));
+                        break;
+                    }
+                    case "monstercard bind": stk.MonsterCardBind = ParseInt(data); break;
                     case "target item id": stk.TargetItemIds = ParseIntList(node, content); break;
+                    case "bead limited usable item": stk.BeadLimitedUsableItemIds = ParseIntList(node, content); break;
 
                     
                     case "physical attack": stk.PhysicalAttack = ParseInt(data); break;
@@ -375,6 +438,7 @@ namespace PvfLib
                 root.GetChildren("package data"),
                 root.GetChildren("package data include usable period"),
                 content);
+            stk.LegacyRewards = ParseLegacyRewards(stk.IntData);
             stk.UpgradableLegacyRewards = ParseUpgradableLegacyRewards(stk.IntData);
             var randomBox = root.GetChild("RANDOMBOX");
             stk.RandomBoxRewards = ParseRandomBoxRewards(randomBox, content);
@@ -492,7 +556,8 @@ namespace PvfLib
             // [upgradable legacy] pots store rewards as itemId/weight/count triples in [int data].
             for (var i = 0; i + 2 < ints.Count; i += 3)
             {
-                if (ints[i] <= 0)
+                // itemId=0 是 PVF 约定的金币奖励，不是空项；负数才是无效物品编号。
+                if (ints[i] < 0)
                     continue;
 
                 rewards.Add(new BoosterRewardEntry
@@ -502,6 +567,29 @@ namespace PvfLib
                     ItemId = ints[i],
                     Weight = Math.Max(0, ints[i + 1]),
                     Count = Math.Max(1, ints[i + 2]),
+                });
+            }
+
+            return rewards;
+        }
+
+        private static List<BoosterRewardEntry> ParseLegacyRewards(string intData)
+        {
+            var rewards = new List<BoosterRewardEntry>();
+            var ints = ParseInts(intData);
+            // [legacy] pots store rewards as itemId/weight pairs in [int data].
+            for (var i = 0; i + 1 < ints.Count; i += 2)
+            {
+                if (ints[i] <= 0)
+                    continue;
+
+                rewards.Add(new BoosterRewardEntry
+                {
+                    RewardKind = "legacy",
+                    Group = 0,
+                    ItemId = ints[i],
+                    Weight = Math.Max(0, ints[i + 1]),
+                    Count = 1,
                 });
             }
 
@@ -893,6 +981,69 @@ namespace PvfLib
             return result;
         }
 
+        private static void ParseExpertJobOnly(ScriptNode node, string content, StackableItemFile item)
+        {
+            if (node == null || item == null)
+                return;
+
+            var raw = node.GetFirstDataContent(content);
+            var typeMatch = Regex.Match(raw ?? string.Empty, "`([^`]*)`");
+            var values = ParseInts(raw);
+            if (typeMatch.Success)
+                item.ExpertJobOnlyType = typeMatch.Groups[1].Value.Trim();
+            if (values.Count > 0)
+                item.ExpertJobOnlyLevel = values[0];
+        }
+
+        private static List<AvatarSelectAbilityChangeEntry> ParseAvatarSelectAbilityChanges(
+            ScriptNode node,
+            string content)
+        {
+            var result = new List<AvatarSelectAbilityChangeEntry>();
+            if (node == null || node.DataItems == null)
+                return result;
+
+            string pendingSourceScope = null;
+            foreach (var item in node.DataItems)
+            {
+                var raw = item.GetContent(content) ?? string.Empty;
+                var scopes = ParseBracketScopes(raw);
+                var values = ParseInts(raw);
+                if (values.Count == 0)
+                {
+                    if (scopes.Count > 0)
+                        pendingSourceScope = scopes[0];
+                    continue;
+                }
+
+                result.Add(new AvatarSelectAbilityChangeEntry
+                {
+                    SourceScope = scopes.Count > 1 ? scopes[0] : pendingSourceScope,
+                    TargetScope = scopes.Count > 1 ? scopes[1] : scopes.Count > 0 ? scopes[0] : null,
+                    AvatarGrade = values[0],
+                    Param = values.Count > 1 ? values[1] : -1,
+                });
+            }
+
+            return result;
+        }
+
+        private static List<string> ParseBracketScopes(string text)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(text))
+                return result;
+
+            foreach (Match match in Regex.Matches(text, "`?\\[(?<scope>[^\\]]+)\\]`?"))
+            {
+                var scope = match.Groups["scope"].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(scope))
+                    result.Add("[" + scope + "]");
+            }
+
+            return result;
+        }
+
         private static byte ResolveAvatarEmblemSocketType(IEnumerable<string> targetTypes)
         {
             byte socketType = 0;
@@ -935,21 +1086,98 @@ namespace PvfLib
 
         private static List<int> ParseIntList(ScriptNode node, string content)
         {
-            var result = new List<int>();
-            if (node == null || node.DataItems == null)
-                return result;
+            return PvfScriptValueReader.ReadIntegers(node, content);
+        }
 
-            foreach (var item in node.DataItems)
+        private static int ResolveFirstPositive(List<int> values, int fallback)
+        {
+            if (values != null)
             {
-                var raw = item.GetContent(content);
-                foreach (var token in raw.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                foreach (var value in values)
                 {
-                    if (int.TryParse(StripBacktick(token), out var value))
-                        result.Add(value);
+                    if (value > 0)
+                        return value;
                 }
             }
 
-            return result;
+            return fallback;
+        }
+
+        private static UpgradeLimitCubeInfo ParseUpgradeLimitCubeInfo(
+            ScriptNode node,
+            string content)
+        {
+            if (node == null)
+                return null;
+
+            var info = new UpgradeLimitCubeInfo();
+            if (!TryParseLimitedCubeRequirements(
+                    node.GetChild("A condition item"),
+                    content,
+                    required: true,
+                    info.ConditionItems)
+                || !TryParseLimitedCubeRequirements(
+                    node.GetChild("B condition item"),
+                    content,
+                    required: false,
+                    info.AdditionalMaterials))
+            {
+                return null;
+            }
+
+            var resultValues = PvfScriptValueReader.ReadIntegers(
+                node.GetChild("result item"),
+                content);
+            if (resultValues.Count == 0 || resultValues.Count % 3 != 0)
+                return null;
+
+            for (var index = 0; index < resultValues.Count; index += 3)
+            {
+                var itemId = resultValues[index];
+                var resultValue = resultValues[index + 1];
+                var weight = resultValues[index + 2];
+                if (itemId <= 0
+                    || resultValue <= 0
+                    || resultValue > short.MaxValue
+                    || weight <= 0)
+                {
+                    return null;
+                }
+
+                info.Results.Add(new LimitedCubeResultEntry
+                {
+                    ItemId = itemId,
+                    ResultValue = (short)resultValue,
+                    Weight = weight,
+                });
+            }
+
+            return info;
+        }
+
+        private static bool TryParseLimitedCubeRequirements(
+            ScriptNode node,
+            string content,
+            bool required,
+            ICollection<LimitedCubeItemRequirement> result)
+        {
+            var values = PvfScriptValueReader.ReadIntegers(node, content);
+            if ((required && values.Count == 0) || values.Count % 2 != 0)
+                return false;
+
+            for (var index = 0; index < values.Count; index += 2)
+            {
+                if (values[index] <= 0 || values[index + 1] <= 0)
+                    return false;
+
+                result.Add(new LimitedCubeItemRequirement
+                {
+                    ItemId = values[index],
+                    Count = values[index + 1],
+                });
+            }
+
+            return true;
         }
 
         private static void ParseActionType(ScriptNode node, string content, StackableItemFile stk)

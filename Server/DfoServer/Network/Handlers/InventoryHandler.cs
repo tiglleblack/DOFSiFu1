@@ -1,6 +1,8 @@
 using DfoServer.Game.Appearance;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Inventory;
+using DfoServer.Game.ExpertJob;
+using DfoServer.Game.Mercenary;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Network.Builders;
 using System;
@@ -19,6 +21,14 @@ namespace DfoServer.Network.Handlers
         private readonly InventoryRefreshSender _refresh;
         private readonly ExperienceItemNotificationService _experienceItemNotifications;
         private readonly Func<byte[], Task> _broadcastGamePacket;
+        private readonly IMercenaryRestrictionService _mercenaryRestrictions;
+        private readonly IExpertJobStateRepository _expertJobStates;
+        private readonly ExpertJobPersistenceService _expertJobPersistence;
+        private readonly ExpertJobOperationCoordinator _expertJobOperations;
+        private readonly MonsterCardBindService _monsterCardBindService;
+        private readonly MonsterCardUpgradeService _monsterCardUpgradeService;
+        private readonly Game.TitleBook.TitleBookAchievementProgressBatcher
+            _titleBookAchievementProgressBatcher;
 
         public string ProtocolName => "GameProtocol";
 
@@ -28,7 +38,11 @@ namespace DfoServer.Network.Handlers
             ICharacterRepository characterRepository,
             InventoryRefreshSender refreshSender,
             ExperienceItemNotificationService experienceItemNotifications,
-            Func<byte[], Task> broadcastGamePacket = null)
+            IExpertJobStateRepository expertJobStates,
+            ExpertJobPersistenceService expertJobPersistence,
+            ExpertJobOperationCoordinator expertJobOperations,
+            Func<byte[], Task> broadcastGamePacket = null,
+            IMercenaryRestrictionService mercenaryRestrictions = null)
         {
             _experienceItemUseService = experienceItemUseService
                 ?? throw new ArgumentNullException(nameof(experienceItemUseService));
@@ -38,10 +52,47 @@ namespace DfoServer.Network.Handlers
             _experienceItemNotifications = experienceItemNotifications
                 ?? throw new ArgumentNullException(nameof(experienceItemNotifications));
             _broadcastGamePacket = broadcastGamePacket;
+            _mercenaryRestrictions = mercenaryRestrictions;
+            _expertJobStates = expertJobStates
+                ?? throw new ArgumentNullException(nameof(expertJobStates));
+            _expertJobPersistence = expertJobPersistence
+                ?? throw new ArgumentNullException(nameof(expertJobPersistence));
+            _expertJobOperations = expertJobOperations
+                ?? throw new ArgumentNullException(nameof(expertJobOperations));
+            _monsterCardBindService = new MonsterCardBindService();
+            _monsterCardUpgradeService = new MonsterCardUpgradeService();
+            _titleBookAchievementProgressBatcher =
+                new Game.TitleBook.TitleBookAchievementProgressBatcher(
+                    FlushUseItemAchievementProgressAsync);
         }
 
         public static (int characterId, int accountId) ResolveOwner(EnhancedClientSession session)
             => SessionOwnerResolver.Resolve(session);
+
+        private async Task BroadcastItemNotice(
+            EnhancedClientSession session,
+            string operation,
+            Func<ushort, byte[]> buildBody,
+            string details)
+        {
+            if (_broadcastGamePacket == null || buildBody == null)
+                return;
+
+            try
+            {
+                var userUniqueId = session?.Player?.UserId ?? 0;
+                if (userUniqueId == 0 && session?.Player?.CharacterId > 0)
+                    userUniqueId = (ushort)session.Player.CharacterId;
+
+                await _broadcastGamePacket(GamePacketEnvelopeBuilder.Build(
+                    0x00, 0x0056, buildBody(userUniqueId)));
+                FileLogger.Log($"[{ProtocolName}] {operation}: notice broadcast type=0x0056 uniqueId={userUniqueId} {details}");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"[{ProtocolName}] {operation}: notice broadcast failed: {ex.Message}");
+            }
+        }
 
         public static bool TryParseDeleteOrSellRequest(byte[] body, out InventoryListType listType, out short slotIndex, out short itemCount)
         {

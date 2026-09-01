@@ -29,7 +29,7 @@ namespace DfoServer.Game.CharacterData
             {
                 conn.Open();
                 using (var cmd = new SqliteCommand(
-                    @"SELECT pc_room_state, expert_job_blob,
+                    @"SELECT pc_room_state,
                              champion_break_key_id, champion_break_mode, champion_break_value,
                              character_option_blob, charac_invisible_falgs_payload_len,
                              racing_dungeon_current_enter_count,
@@ -45,24 +45,20 @@ namespace DfoServer.Game.CharacterData
                             return;
                         snapshot.PcRoomPlayTimeState = (byte)reader.GetInt32(0);
 
-                        var expertBlob = reader.IsDBNull(1) ? null : (byte[])reader[1];
-                        if (expertBlob != null)
-                            DeserializeExpertJobInfo(expertBlob, snapshot.ExpertJobInfo);
+                        snapshot.ChampionBreakSystem.KeyId = reader.GetInt32(1);
+                        snapshot.ChampionBreakSystem.Mode = (byte)reader.GetInt32(2);
+                        snapshot.ChampionBreakSystem.Value = reader.GetInt32(3);
 
-                        snapshot.ChampionBreakSystem.KeyId = reader.GetInt32(2);
-                        snapshot.ChampionBreakSystem.Mode = (byte)reader.GetInt32(3);
-                        snapshot.ChampionBreakSystem.Value = reader.GetInt32(4);
+                        snapshot.CharacterOptionBlob = reader.IsDBNull(4) ? null : (byte[])reader[4];
+                        snapshot.CharacInvisibleFalgsPayloadLen = reader.IsDBNull(5) ? 0u : (uint)reader.GetInt64(5);
+                        snapshot.RacingDungeonCurrentEnterCount = reader.IsDBNull(6) ? 0u : (uint)reader.GetInt64(6);
 
-                        snapshot.CharacterOptionBlob = reader.IsDBNull(5) ? null : (byte[])reader[5];
-                        snapshot.CharacInvisibleFalgsPayloadLen = reader.IsDBNull(6) ? 0u : (uint)reader.GetInt64(6);
-                        snapshot.RacingDungeonCurrentEnterCount = reader.IsDBNull(7) ? 0u : (uint)reader.GetInt64(7);
-
-                        snapshot.AckCharSlotIndex = reader.IsDBNull(8) ? (byte)0 : (byte)reader.GetInt32(8);
-                        snapshot.AckFatigueBattery = reader.IsDBNull(9) ? (ushort)0 : (ushort)reader.GetInt32(9);
-                        snapshot.AckFatigueGrownUpBuff = reader.IsDBNull(10) ? (ushort)0 : (ushort)reader.GetInt32(10);
-                        snapshot.AckTradePunishFlag = reader.IsDBNull(11) ? (byte)0 : (byte)reader.GetInt32(11);
-                        snapshot.AckExtraField86JP = reader.IsDBNull(12) ? (ushort)0 : (ushort)reader.GetInt32(12);
-                        snapshot.AckTutorialSkipable = reader.IsDBNull(13) ? (byte)0 : (byte)reader.GetInt32(13);
+                        snapshot.AckCharSlotIndex = reader.IsDBNull(7) ? (byte)0 : (byte)reader.GetInt32(7);
+                        snapshot.AckFatigueBattery = reader.IsDBNull(8) ? (ushort)0 : (ushort)reader.GetInt32(8);
+                        snapshot.AckFatigueGrownUpBuff = reader.IsDBNull(9) ? (ushort)0 : (ushort)reader.GetInt32(9);
+                        snapshot.AckTradePunishFlag = reader.IsDBNull(10) ? (byte)0 : (byte)reader.GetInt32(10);
+                        snapshot.AckExtraField86JP = reader.IsDBNull(11) ? (ushort)0 : (ushort)reader.GetInt32(11);
+                        snapshot.AckTutorialSkipable = reader.IsDBNull(12) ? (byte)0 : (byte)reader.GetInt32(12);
                     }
                 }
 
@@ -176,6 +172,38 @@ namespace DfoServer.Game.CharacterData
                     }
                 }
 
+                snapshot.DailyChallengeRewardClaimFlags = new byte[6];
+                using (var cmd = new SqliteCommand(
+                    "SELECT group_index FROM character_daily_challenge_claims WHERE character_id = @cid ORDER BY group_index", conn))
+                {
+                    cmd.Parameters.AddWithValue("@cid", characterId);
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            var groupIndex = reader.GetInt32(0);
+                            if (groupIndex >= 0 && groupIndex < snapshot.DailyChallengeRewardClaimFlags.Length)
+                                snapshot.DailyChallengeRewardClaimFlags[groupIndex] = 1;
+                        }
+                    }
+                }
+
+                using (var cmd = new SqliteCommand(
+                    "SELECT target_value, progress_value FROM character_daily_challenge_special_state WHERE character_id = @cid", conn))
+                {
+                    cmd.Parameters.AddWithValue("@cid", characterId);
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            snapshot.DailyChallengeSpecialTarget =
+                                (uint)reader.GetInt64(0);
+                            snapshot.DailyChallengeSpecialProgress =
+                                (uint)reader.GetInt64(1);
+                        }
+                    }
+                }
+
                 snapshot.RacingDungeonTailIds.Clear();
                 using (var cmd = new SqliteCommand(
                     "SELECT id_value FROM character_daily_challenge_tail_ids WHERE character_id = @cid ORDER BY sort_order", conn))
@@ -192,45 +220,96 @@ namespace DfoServer.Game.CharacterData
 
         public bool UpsertDungeonPermission(int characterId, int dungeonId, byte newClearState)
         {
+            if (dungeonId <= 0
+                || dungeonId > ushort.MaxValue
+                || newClearState == 0)
+                return false;
+
+            ApplyDungeonPermissionBatch(
+                characterId,
+                new[]
+                {
+                    new DungeonPermissionEntrySnapshot
+                    {
+                        DungeonId = (ushort)dungeonId,
+                        ClearState = newClearState,
+                    },
+                },
+                out var changes);
+            return changes.Count > 0;
+        }
+
+        internal List<DungeonPermissionEntrySnapshot>
+            ApplyDungeonPermissionBatch(
+                int characterId,
+                IReadOnlyCollection<DungeonPermissionEntrySnapshot> updates,
+                out List<DungeonPermissionEntrySnapshot> changes)
+        {
+            if (characterId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(characterId));
+            if (updates == null)
+                throw new ArgumentNullException(nameof(updates));
+
+            var normalized = new List<DungeonPermissionEntrySnapshot>();
+            var indexes = new Dictionary<ushort, int>();
+            foreach (var update in updates)
+            {
+                if (update == null
+                    || update.DungeonId == 0
+                    || update.ClearState == 0)
+                {
+                    throw new ArgumentException(
+                        "Dungeon permission updates require non-zero dungeon and state values.",
+                        nameof(updates));
+                }
+
+                if (indexes.TryGetValue(update.DungeonId, out var index))
+                {
+                    if (normalized[index].ClearState < update.ClearState)
+                        normalized[index].ClearState = update.ClearState;
+                    continue;
+                }
+
+                indexes[update.DungeonId] = normalized.Count;
+                normalized.Add(new DungeonPermissionEntrySnapshot
+                {
+                    DungeonId = update.DungeonId,
+                    ClearState = update.ClearState,
+                });
+            }
+
+            changes = new List<DungeonPermissionEntrySnapshot>();
             using (var conn = new SqliteConnection(_connectionString))
             {
                 conn.Open();
-                int currentState = 0;
-                using (var cmd = new SqliteCommand(
-                    "SELECT clear_state FROM character_dungeon_permissions WHERE character_id = @cid AND dungeon_id = @did", conn))
+                using (var tx = conn.BeginTransaction(deferred: false))
                 {
-                    cmd.Parameters.AddWithValue("@cid", characterId);
-                    cmd.Parameters.AddWithValue("@did", dungeonId);
-                    var existing = cmd.ExecuteScalar();
-                    if (existing != null && existing != DBNull.Value)
-                        currentState = Convert.ToInt32(existing);
-                }
-                if (currentState >= newClearState) return false;
+                    foreach (var update in normalized)
+                    {
+                        if (!UpsertDungeonPermission(
+                                conn,
+                                tx,
+                                characterId,
+                                update.DungeonId,
+                                update.ClearState))
+                        {
+                            continue;
+                        }
 
-                if (currentState > 0)
-                {
-                    using (var cmd = new SqliteCommand(
-                        "UPDATE character_dungeon_permissions SET clear_state = @cs WHERE character_id = @cid AND dungeon_id = @did", conn))
-                    {
-                        cmd.Parameters.AddWithValue("@cid", characterId);
-                        cmd.Parameters.AddWithValue("@did", dungeonId);
-                        cmd.Parameters.AddWithValue("@cs", (int)newClearState);
-                        cmd.ExecuteNonQuery();
+                        changes.Add(new DungeonPermissionEntrySnapshot
+                        {
+                            DungeonId = update.DungeonId,
+                            ClearState = update.ClearState,
+                        });
                     }
+
+                    var snapshot = LoadDungeonPermissions(
+                        conn,
+                        tx,
+                        characterId);
+                    tx.Commit();
+                    return snapshot;
                 }
-                else
-                {
-                    using (var cmd = new SqliteCommand(@"
-INSERT INTO character_dungeon_permissions (character_id, sort_order, dungeon_id, clear_state)
-VALUES (@cid, (SELECT COALESCE(MAX(sort_order),0)+1 FROM character_dungeon_permissions WHERE character_id=@cid), @did, @cs)", conn))
-                    {
-                        cmd.Parameters.AddWithValue("@cid", characterId);
-                        cmd.Parameters.AddWithValue("@did", dungeonId);
-                        cmd.Parameters.AddWithValue("@cs", (int)newClearState);
-                        cmd.ExecuteNonQuery();
-                    }
-                }
-                return true;
             }
         }
 
@@ -244,24 +323,109 @@ VALUES (@cid, (SELECT COALESCE(MAX(sort_order),0)+1 FROM character_dungeon_permi
             using (var conn = new SqliteConnection(_connectionString))
             {
                 conn.Open();
-                using (var cmd = new SqliteCommand(
-                    @"SELECT dungeon_id, clear_state
-                      FROM character_dungeon_permissions
-                      WHERE character_id = @cid
-                      ORDER BY sort_order",
-                    conn))
+                return LoadDungeonPermissions(
+                    conn,
+                    transaction: null,
+                    characterId);
+            }
+        }
+
+        private static bool UpsertDungeonPermission(
+            SqliteConnection connection,
+            SqliteTransaction transaction,
+            int characterId,
+            int dungeonId,
+            byte newClearState)
+        {
+            var currentState = 0;
+            var existingRows = 0;
+            using (var command = new SqliteCommand(@"
+SELECT COUNT(*), COALESCE(MAX(clear_state), 0)
+FROM character_dungeon_permissions
+WHERE character_id = @cid AND dungeon_id = @did;",
+                connection,
+                transaction))
+            {
+                command.Parameters.AddWithValue("@cid", characterId);
+                command.Parameters.AddWithValue("@did", dungeonId);
+                using (var reader = command.ExecuteReader())
                 {
-                    cmd.Parameters.AddWithValue("@cid", characterId);
-                    using (var reader = cmd.ExecuteReader())
+                    if (reader.Read())
                     {
-                        while (reader.Read())
+                        existingRows = reader.GetInt32(0);
+                        currentState = reader.GetInt32(1);
+                    }
+                }
+            }
+
+            if (currentState >= newClearState)
+                return false;
+
+            if (existingRows > 0)
+            {
+                using (var command = new SqliteCommand(@"
+UPDATE character_dungeon_permissions
+SET clear_state = @state
+WHERE character_id = @cid AND dungeon_id = @did;",
+                    connection,
+                    transaction))
+                {
+                    command.Parameters.AddWithValue("@state", (int)newClearState);
+                    command.Parameters.AddWithValue("@cid", characterId);
+                    command.Parameters.AddWithValue("@did", dungeonId);
+                    command.ExecuteNonQuery();
+                }
+            }
+            else
+            {
+                using (var command = new SqliteCommand(@"
+INSERT INTO character_dungeon_permissions
+    (character_id, sort_order, dungeon_id, clear_state)
+VALUES
+    (@cid,
+     (SELECT COALESCE(MAX(sort_order), 0) + 1
+      FROM character_dungeon_permissions
+      WHERE character_id = @cid),
+     @did,
+     @state);",
+                    connection,
+                    transaction))
+                {
+                    command.Parameters.AddWithValue("@cid", characterId);
+                    command.Parameters.AddWithValue("@did", dungeonId);
+                    command.Parameters.AddWithValue("@state", (int)newClearState);
+                    command.ExecuteNonQuery();
+                }
+            }
+
+            return true;
+        }
+
+        private static List<DungeonPermissionEntrySnapshot>
+            LoadDungeonPermissions(
+                SqliteConnection connection,
+                SqliteTransaction transaction,
+                int characterId)
+        {
+            var result = new List<DungeonPermissionEntrySnapshot>();
+            using (var command = new SqliteCommand(@"
+SELECT dungeon_id, clear_state
+FROM character_dungeon_permissions
+WHERE character_id = @cid
+ORDER BY sort_order;",
+                connection,
+                transaction))
+            {
+                command.Parameters.AddWithValue("@cid", characterId);
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        result.Add(new DungeonPermissionEntrySnapshot
                         {
-                            result.Add(new DungeonPermissionEntrySnapshot
-                            {
-                                DungeonId = (ushort)reader.GetInt32(0),
-                                ClearState = (byte)reader.GetInt32(1),
-                            });
-                        }
+                            DungeonId = (ushort)reader.GetInt32(0),
+                            ClearState = (byte)reader.GetInt32(1),
+                        });
                     }
                 }
             }
@@ -278,14 +442,14 @@ VALUES (@cid, (SELECT COALESCE(MAX(sort_order),0)+1 FROM character_dungeon_permi
                 {
                     using (var cmd = new SqliteCommand(
                         @"INSERT INTO character_init_flags
-                          (character_id, pc_room_state, expert_job_blob,
+                          (character_id, pc_room_state,
                            champion_break_key_id, champion_break_mode, champion_break_value,
                            character_option_blob, charac_invisible_falgs_payload_len,
                            racing_dungeon_current_enter_count,
                            ack_char_slot_index, ack_fatigue_battery, ack_fatigue_grownup_buff,
                            ack_trade_punish_flag, ack_extra_field_86jp,
                            ack_tutorial_skipable)
-                          VALUES (@cid, @pcr, @expert,
+                          VALUES (@cid, @pcr,
                                   @champKey, @champMode, @champValue,
                                   @charOpt, @ciplen,
                                   @rdcc,
@@ -294,7 +458,6 @@ VALUES (@cid, (SELECT COALESCE(MAX(sort_order),0)+1 FROM character_dungeon_permi
                                   @ackTutSkip)
                           ON CONFLICT(character_id) DO UPDATE SET
                             pc_room_state=excluded.pc_room_state,
-                            expert_job_blob=excluded.expert_job_blob,
                             champion_break_key_id=excluded.champion_break_key_id,
                             champion_break_mode=excluded.champion_break_mode,
                             champion_break_value=excluded.champion_break_value,
@@ -310,7 +473,6 @@ VALUES (@cid, (SELECT COALESCE(MAX(sort_order),0)+1 FROM character_dungeon_permi
                     {
                         cmd.Parameters.AddWithValue("@cid", characterId);
                         cmd.Parameters.AddWithValue("@pcr", (int)snapshot.PcRoomPlayTimeState);
-                        cmd.Parameters.AddWithValue("@expert", SerializeExpertJobInfo(snapshot.ExpertJobInfo));
                         cmd.Parameters.AddWithValue("@champKey", snapshot.ChampionBreakSystem.KeyId);
                         cmd.Parameters.AddWithValue("@champMode", (int)snapshot.ChampionBreakSystem.Mode);
                         cmd.Parameters.AddWithValue("@champValue", snapshot.ChampionBreakSystem.Value);
@@ -601,47 +763,6 @@ ON CONFLICT(character_id) DO UPDATE SET
             snapshot.Unknown725Packets.AddRange(u725);
 
             snapshot.Unknown730 = _miscState.LoadUnknown730(characterId);
-        }
-
-
-
-
-
-
-        private static byte[] SerializeExpertJobInfo(ExpertJobInfoSnapshot info)
-        {
-            var list = new List<byte>();
-            list.Add(info.State0);
-            list.Add(info.Mode);
-            list.AddRange(BitConverter.GetBytes(info.ValueA));
-            list.AddRange(BitConverter.GetBytes(info.ValueB));
-            list.Add((byte)info.Entries.Count);
-            foreach (var entry in info.Entries)
-                list.AddRange(BitConverter.GetBytes(entry));
-            return list.ToArray();
-        }
-
-        private static void DeserializeExpertJobInfo(byte[] blob, ExpertJobInfoSnapshot info)
-        {
-            if (blob.Length < 2) return;
-            info.State0 = blob[0];
-            info.Mode = blob[1];
-            int offset = 2;
-            if (offset + 8 <= blob.Length)
-            {
-                info.ValueA = BitConverter.ToInt32(blob, offset); offset += 4;
-                info.ValueB = BitConverter.ToInt32(blob, offset); offset += 4;
-            }
-            if (offset < blob.Length)
-            {
-                var count = blob[offset++];
-                info.Entries.Clear();
-                for (int i = 0; i < count && offset + 4 <= blob.Length; i++)
-                {
-                    info.Entries.Add(BitConverter.ToInt32(blob, offset));
-                    offset += 4;
-                }
-            }
         }
 
     }

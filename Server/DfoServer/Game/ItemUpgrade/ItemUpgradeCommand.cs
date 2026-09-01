@@ -1,9 +1,11 @@
 using System.Collections.Generic;
+using DfoServer.Game.Inventory;
 
 namespace DfoServer.Game.ItemUpgrade
 {
     public sealed class ItemUpgradeCommand
     {
+        public ItemUpgradeMethod Method { get; set; }
         public ItemUpgradeMode Mode { get; set; }
         public short TargetSlotIndex { get; set; }
         public int TargetItemTemplateId { get; set; }
@@ -30,6 +32,7 @@ namespace DfoServer.Game.ItemUpgrade
         public ItemUpgradeCommand Command { get; set; }
         public bool Success { get; set; }
         public byte ErrorCode { get; set; }
+        public ItemUpgradeMethod Method { get; set; }
         public ItemUpgradeMode Mode { get; set; }
         public ItemUpgradeScene Scene { get; set; }
         public short TargetSlotIndex { get; set; }
@@ -48,12 +51,14 @@ namespace DfoServer.Game.ItemUpgrade
         public int GoldCost { get; set; }
         public int UpdatedGold { get; set; }
         public bool NoticeRequired { get; set; }
+        internal ItemCore TargetItemSnapshot { get; set; }
 
         public static ItemUpgradeResult Error(ItemUpgradeCommand command, byte errorCode)
         {
             return new ItemUpgradeResult
             {
                 Command = command,
+                Method = command != null ? command.Method : ItemUpgradeMethod.Reinforce,
                 Mode = command != null ? command.Mode : ItemUpgradeMode.Reinforce,
                 TargetSlotIndex = command != null ? command.TargetSlotIndex : (short)-1,
                 TargetItemTemplateId = command != null ? command.TargetItemTemplateId : 0,

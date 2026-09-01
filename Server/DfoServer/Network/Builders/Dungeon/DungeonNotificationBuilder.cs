@@ -131,7 +131,7 @@ namespace DfoServer.Network.Builders
 
                 writer.WriteUInt16(monster.TemplateOrder);
                 writer.WriteInt32(packetIndex);
-                writer.WriteUInt16((ushort)(firstMonsterSequence + i + 1));
+                writer.WriteUInt16((ushort)(firstMonsterSequence + i));
                 writer.WriteInt32(monster.Code);
                 writer.WriteByte(monster.Level);
                 writer.WriteByte(monster.Type);
@@ -175,7 +175,7 @@ namespace DfoServer.Network.Builders
                     writer.WriteInt32(r.PosY);
                     writer.WriteInt32(r.ObjectIndex);
                     writer.WriteInt32(r.Faction);
-                    writer.WriteInt32(0);
+                    writer.WriteInt32(r.SpawnMode);
                 }
             }
             else
@@ -353,27 +353,33 @@ namespace DfoServer.Network.Builders
         // df_game_r CParty::clear_reward / getClearRewardBonusExp:
         // 总经验显示由通关基础经验、通关奖励字段、额外经验槽位、尾部杀怪经验共同组成。
         // 槽位：1-13 通关额外奖励，14-25 杀怪额外奖励，101-108 后置额外奖励。
-        public static byte[] BuildClearDungeonReward(uint clearBaseExp, int scoreBonusExp = 0, uint clearBonusExp = 0,
+        public static byte[] BuildClearDungeonReward(uint clearBaseExp, int scoreBonusExp = 0,
+            uint partyClearBreakdownExp = 0,
+            int avatarExp = 0, int creatureExp = 0,
             int blackDiamondExp = 0, int growthContractExp = 0,
             int monsterGrowthContractExp = 0, int adventureGroupExp = 0,
+            int channelExp = 0,
             uint monsterExp = 0, int bossExp = 0, int championExp = 0, int superChampionExp = 0,
-            int freeCardGold = 0, int freeCardItemId = 0, int freeCardItemCount = 0)
+            int freeCardGold = 0, int freeCardItemId = 0, int freeCardItemCount = 0,
+            int paidCardCost = 0)
         {
             var w = new GamePacketWriter();
 
             // === BASE BLOCK (117B = 4u32 + 1u8 + 25u32) ===
             w.WriteUInt32(clearBaseExp);
             w.WriteInt32(scoreBonusExp);
-            w.WriteUInt32(clearBonusExp);
-            w.WriteUInt32(0);               // #4  baseExp → bonus[0]
+            w.WriteUInt32(partyClearBreakdownExp);
+            w.WriteInt32(avatarExp);         // #4: 装扮通关奖励
             w.WriteByte(0);
             for (int i = 0; i < 25; i++)
             {
                 var value = 0;
                 if (i == 2) value = blackDiamondExp;       // 槽位3: 黑钻
+                else if (i == 5) value = creatureExp;       // 槽位6: 宠物通关奖励
                 else if (i == 7) value = adventureGroupExp; // 槽 8：冒险团通关经验
                 else if (i == 9) value = growthContractExp; // 槽位10: 成长之契约
                 else if (i == 18) value = monsterGrowthContractExp; // 槽位19: 杀怪成长之契约
+                else if (i == 23) value = channelExp;       // 槽位24: 频道奖励
                 w.WriteInt32(value);
             }
 
@@ -409,8 +415,8 @@ namespace DfoServer.Network.Builders
             for (int i = 1; i < 8; i++)
                 w.WriteByte(0);
 
-            // === TOTAL REWARD SUM (4B) ===
-            w.WriteInt32(0);
+            // === PAID-CARD COMMISSION (4B) ===
+            w.WriteInt32(Math.Max(0, paidCardCost));
 
             // === BUFF TABLE 2 (8B) ===
             for (int i = 0; i < 8; i++)

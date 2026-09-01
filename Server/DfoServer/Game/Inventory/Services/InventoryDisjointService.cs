@@ -3,15 +3,31 @@ using System.Collections.Generic;
 
 namespace DfoServer.Game.Inventory
 {
+    internal delegate bool TryResolveDisjointMaterials(
+        ItemCore source,
+        ItemMetadata metadata,
+        out List<DisjointMaterialResult> materials,
+        out byte errorCode);
+
     internal static class InventoryDisjointService
     {
         internal static bool TryDisjointItem(
             InventoryService inventory,
             DisjointItemRequest request,
             out DisjointItemResult result)
+            => TryDisjointItem(inventory, request, TryResolveSystemMaterials, out result);
+
+        internal static bool TryDisjointItem(
+            InventoryService inventory,
+            DisjointItemRequest request,
+            TryResolveDisjointMaterials tryResolveMaterials,
+            out DisjointItemResult result)
         {
             result = CreateErrorResult(request, DisjointItemResult.ErrorInvalidRequest);
-            if (inventory == null || request == null || request.TargetSlotIndex < 0)
+            if (inventory == null
+                || request == null
+                || tryResolveMaterials == null
+                || request.TargetSlotIndex < 0)
                 return false;
 
             if (request.ItemSpace != InventoryListType.Main || request.DisjointItemSlotIndex < -1)
@@ -51,10 +67,13 @@ namespace DfoServer.Game.Inventory
                 return false;
             }
 
-            var materials = DisjointResultCalculator.Calculate(metadata);
-            if (materials.Count == 0)
+            if (!tryResolveMaterials(source, metadata, out var materials, out errorCode)
+                || materials == null
+                || materials.Count == 0)
             {
-                result = CreateErrorResult(request, DisjointItemResult.ErrorInvalidTarget);
+                result = CreateErrorResult(
+                    request,
+                    errorCode == 0 ? DisjointItemResult.ErrorInvalidTarget : errorCode);
                 result.SourceItemTemplateId = source.ItemId;
                 return false;
             }
@@ -66,27 +85,33 @@ namespace DfoServer.Game.Inventory
                 return false;
             }
 
-            if (!inventory.RemoveItem(InventoryListType.Main, request.TargetSlotIndex))
+            if (!InventoryDeleteService.TryRemoveSlot(
+                    inventory,
+                    InventoryListType.Main,
+                    request.TargetSlotIndex,
+                    out var deleteResult)
+                || !deleteResult.Success)
             {
                 result = CreateErrorResult(request, DisjointItemResult.ErrorInvalidTarget);
                 result.SourceItemTemplateId = source.ItemId;
                 return false;
             }
 
+            InventoryDeleteResult disjointToolDelete = null;
             if (disjointTool != null
                 && !InventoryDeleteService.TryDecreaseStack(
                     inventory,
                     InventoryListType.Main,
                     request.DisjointItemSlotIndex,
                     1,
-                    out _))
+                    out disjointToolDelete))
             {
                 result = CreateErrorResult(request, DisjointItemResult.ErrorInvalidTarget);
                 result.SourceItemTemplateId = source.ItemId;
                 return false;
             }
 
-            if (!GrantMaterials(inventory, materials))
+            if (!GrantMaterials(inventory, materials, out var materialMutations))
             {
                 result = CreateErrorResult(request, DisjointItemResult.ErrorInventoryFull);
                 result.SourceItemTemplateId = source.ItemId;
@@ -100,6 +125,24 @@ namespace DfoServer.Game.Inventory
                 SourceItemTemplateId = source.ItemId,
             };
             result.Materials.AddRange(materials);
+            var sourceMutation = InventoryMutationResultFactory.FromDelete(
+                InventoryListType.Main,
+                request.TargetSlotIndex,
+                source,
+                deleteResult);
+            if (sourceMutation != null)
+                result.InventoryMutations.Add(sourceMutation);
+            if (disjointToolDelete != null)
+            {
+                var toolMutation = InventoryMutationResultFactory.FromDelete(
+                    InventoryListType.Main,
+                    request.DisjointItemSlotIndex,
+                    disjointTool,
+                    disjointToolDelete);
+                if (toolMutation != null)
+                    result.InventoryMutations.Add(toolMutation);
+            }
+            result.InventoryMutations.AddRange(materialMutations);
             return true;
         }
 
@@ -119,10 +162,22 @@ namespace DfoServer.Game.Inventory
             if (IsTradeDeleteAttachType(metadata.AttachType))
                 return false;
 
+            return true;
+        }
+
+        private static bool TryResolveSystemMaterials(
+            ItemCore source,
+            ItemMetadata metadata,
+            out List<DisjointMaterialResult> materials,
+            out byte errorCode)
+        {
+            materials = null;
+            errorCode = DisjointItemResult.ErrorInvalidTarget;
             if (IsUnidentifiedAmplifyEquipment(source))
                 return false;
 
-            return true;
+            materials = DisjointResultCalculator.Calculate(metadata);
+            return materials.Count > 0;
         }
 
         private static bool TryValidatePortableDisjointItem(
@@ -167,8 +222,10 @@ namespace DfoServer.Game.Inventory
 
         private static bool GrantMaterials(
             InventoryService inventory,
-            IReadOnlyList<DisjointMaterialResult> materials)
+            IReadOnlyList<DisjointMaterialResult> materials,
+            out List<InventoryMutationResult> mutations)
         {
+            mutations = new List<InventoryMutationResult>();
             if (!BuildGrantRequests(materials, out var requests)
                 || !InventoryRewardGrantService.TryGrantBatch(inventory, requests, out var grantResult)
                 || !grantResult.Success
@@ -180,6 +237,9 @@ namespace DfoServer.Game.Inventory
                 var material = materials[index];
                 var grant = grantResult.Results[index];
                 material.SlotIndex = grant.SlotIndex;
+                var mutation = InventoryMutationResultFactory.FromGrant(inventory, grant);
+                if (mutation != null)
+                    mutations.Add(mutation);
             }
 
             return true;

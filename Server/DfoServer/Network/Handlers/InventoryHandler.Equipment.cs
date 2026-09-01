@@ -159,7 +159,7 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
-            FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM raw({body?.Length ?? 0}B): {(body != null ? BitConverter.ToString(body) : "null")} mode={request.Mode} target=({request.TargetSlotIndex},0x{request.TargetItemTemplateId:X8}) materialSlot={request.MaterialSlotIndex} optSlot={request.OptionalTicketSlotIndex} name={request.TargetItemName}");
+            FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM raw({body?.Length ?? 0}B): {(body != null ? BitConverter.ToString(body) : "null")} method={request.Method} mode={request.Mode} target=({request.TargetSlotIndex},0x{request.TargetItemTemplateId:X8}) materialSlot={request.MaterialSlotIndex} optSlot={request.OptionalTicketSlotIndex} name={request.TargetItemName}");
 
             var (cid, _) = ResolveOwner(session);
             var command = request.ToCommand();
@@ -197,7 +197,7 @@ namespace DfoServer.Network.Handlers
             if (!ok)
             {
                 var errorCode = result != null ? result.ErrorCode : ItemUpgradeResult.ErrorInvalidTarget;
-                FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM: FAILED error={errorCode} mode={request.Mode} targetSlot={request.TargetSlotIndex} materialSlot={request.MaterialSlotIndex}");
+                FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM: FAILED error={errorCode} method={request.Method} mode={request.Mode} targetSlot={request.TargetSlotIndex} materialSlot={request.MaterialSlotIndex}");
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0050, ItemUpgradeAckBuilder.BuildError(errorCode)));
                 return;
             }
@@ -219,28 +219,19 @@ namespace DfoServer.Network.Handlers
             if (result.NoticeRequired)
                 await BroadcastItemUpgradeNotice(session, result);
 
-            FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM: OK scene={result.Scene} mode={result.Mode} targetSlot={result.TargetSlotIndex} level={result.OldLevel}->{result.NewLevel} success={result.UpgradeSucceeded} resultCode={result.ResultCode} rate={result.FinalSuccessWeight} gold={result.UpdatedGold}");
+            FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM: OK scene={result.Scene} method={result.Method} mode={result.Mode} targetSlot={result.TargetSlotIndex} level={result.OldLevel}->{result.NewLevel} success={result.UpgradeSucceeded} resultCode={result.ResultCode} rate={result.FinalSuccessWeight} gold={result.UpdatedGold}");
         }
 
         private async Task BroadcastItemUpgradeNotice(EnhancedClientSession session, ItemUpgradeResult result)
         {
-            if (_broadcastGamePacket == null || result == null)
+            if (result == null)
                 return;
 
-            try
-            {
-                var userUniqueId = session?.Player?.UserId ?? 0;
-                if (userUniqueId == 0 && session?.Player?.CharacterId > 0)
-                    userUniqueId = (ushort)session.Player.CharacterId;
-
-                var body = ItemUpgradeNoticeBuilder.Build(result, userUniqueId);
-                await _broadcastGamePacket(GamePacketEnvelopeBuilder.Build(0x00, 0x0056, body));
-                FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM: notice broadcast type=0x0056 uniqueId={userUniqueId} item=0x{result.TargetItemTemplateId:X8} level={result.NewLevel} mode={result.Mode}");
-            }
-            catch (Exception ex)
-            {
-                FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM: notice broadcast failed: {ex.Message}");
-            }
+            await BroadcastItemNotice(
+                session,
+                "UPGRADE_ITEM",
+                userUniqueId => ItemUpgradeNoticeBuilder.Build(result, userUniqueId),
+                $"item=0x{result.TargetItemTemplateId:X8} level={result.NewLevel} mode={result.Mode}");
         }
 
         public async Task Handle_EQUIPMENT_SOCKET_OPEN(EnhancedClientSession session, GamePacketHeader header, byte[] body)

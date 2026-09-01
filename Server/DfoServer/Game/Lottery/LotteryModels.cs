@@ -16,6 +16,12 @@ namespace DfoServer.Game.Lottery
         public int RequiredItemCount { get; set; }
 
         public IReadOnlyList<PvfLib.BoosterRewardEntry> RewardPool { get; set; }
+
+        public bool UsesIncreaseChanceProgress { get; set; }
+
+        public int ProgressResetCount { get; set; }
+
+        public int ProgressResetGoldCost { get; set; }
     }
 
     public sealed class LotterySourceContext
@@ -39,6 +45,8 @@ namespace DfoServer.Game.Lottery
 
         public int UpdatedGold { get; set; }
 
+        public int GrantedGold { get; set; }
+
         public int ConsumedRequiredItemTemplateId { get; set; }
 
         public int ConsumedRequiredItemCount { get; set; }
@@ -47,7 +55,22 @@ namespace DfoServer.Game.Lottery
 
         public bool UsedDoubleReward { get; set; }
 
+        public bool DeliveredToMailbox { get; set; }
+
+        public LotteryProgressSnapshot Progress { get; set; }
+
         public List<LotteryRewardGrant> Rewards { get; } = new List<LotteryRewardGrant>();
+    }
+
+    public sealed class LotteryProgressSnapshot
+    {
+        public int ItemTemplateId { get; set; }
+
+        public int NewRewardIndex { get; set; } = -1;
+
+        public bool AutoReset { get; set; }
+
+        public HashSet<int> ClaimedRewardIndexes { get; } = new HashSet<int>();
     }
 
     public sealed class LotteryRewardGrant
@@ -61,6 +84,8 @@ namespace DfoServer.Game.Lottery
         public int StackCount { get; set; }
 
         public int GrantedCount { get; set; }
+
+        internal ItemCore DisplayCore { get; set; }
     }
 
 }

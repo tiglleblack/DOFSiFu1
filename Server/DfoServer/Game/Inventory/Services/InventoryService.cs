@@ -501,6 +501,11 @@ namespace DfoServer.Game.Inventory
             return true;
         }
 
+        internal void RestorePendingHappyTokenCeraGrant(int count)
+        {
+            _pendingHappyTokenCeraGrant = Math.Max(0, count);
+        }
+
         public void ClearDirtyState()
         {
             _dirtySlots.Clear();
@@ -656,6 +661,8 @@ namespace DfoServer.Game.Inventory
                     return CargoModel.NormalizeCapacity(value);
                 case InventoryListType.AccountCargo:
                     return AccountCargoModel.NormalizeSelectionKey(value);
+                case InventoryListType.Avatar:
+                    return AvatarInventoryExpansionRule.NormalizeExpansion(value);
                 default:
                     return value;
             }

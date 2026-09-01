@@ -16,6 +16,7 @@ namespace DfoServer.Game.Inventory
         MailAttachment = 6,
         AdminGrant = 7,
         CharacterCreate = 8,
+        DailyRefill = 9,
     }
 
     internal sealed class InventoryCreateOptions
@@ -25,6 +26,10 @@ namespace DfoServer.Game.Inventory
         public byte CreatureType { get; set; }
 
         public int ExpireTime { get; set; }
+
+        public AvatarDetail AvatarDetailTemplate { get; set; }
+
+        public CreatureDetail CreatureDetailTemplate { get; set; }
     }
 
     internal sealed class InventoryCreateResult
@@ -209,6 +214,8 @@ namespace DfoServer.Game.Inventory
                 if (result.AvatarDetail == null)
                     return false;
 
+                ApplyAvatarDefaultSockets(result.AvatarDetail, core.ItemId);
+                ApplyAvatarDetailTemplate(result.AvatarDetail, options?.AvatarDetailTemplate);
                 ApplyCreateReason(result, reason, options);
                 return true;
             }
@@ -222,12 +229,61 @@ namespace DfoServer.Game.Inventory
                 if (result.CreatureDetail == null)
                     return false;
 
+                ApplyCreatureDetailTemplate(result.CreatureDetail, options?.CreatureDetailTemplate);
                 ApplyCreateReason(result, reason, options);
                 return true;
             }
 
             ApplyCreateReason(result, reason, options);
             return true;
+        }
+
+        private static void ApplyAvatarDetailTemplate(AvatarDetail target, AvatarDetail template)
+        {
+            if (target == null || template == null)
+                return;
+
+            target.ExpireDate = template.ExpireDate;
+            target.ClearAvatarId = template.ClearAvatarId;
+            target.JewelSocket = template.JewelSocket;
+            target.Color1 = template.Color1;
+            target.Color2 = template.Color2;
+            target.DeleteDate = template.DeleteDate;
+        }
+
+        private static void ApplyAvatarDefaultSockets(AvatarDetail target, int itemTemplateId)
+        {
+            if (target == null || itemTemplateId <= 0)
+                return;
+
+            var socketTypes = ItemMetadataResolver.ResolveAvatarDefaultSocketTypes(itemTemplateId);
+            if (socketTypes == null || socketTypes.Count == 0)
+                return;
+
+            var socket = target.JewelSocketView;
+            for (var index = 0; index < JewelSocket.SocketCount; index++)
+            {
+                var socketType = index < socketTypes.Count ? socketTypes[index] : (byte)0;
+                socket.Set(index, socketType, socketType != 0 ? -1 : 0);
+            }
+
+            target.JewelSocketView = socket;
+        }
+
+        private static void ApplyCreatureDetailTemplate(CreatureDetail target, CreatureDetail template)
+        {
+            if (target == null || template == null)
+                return;
+
+            target.NameBytes = template.NameBytes;
+            target.Field04 = template.Field04;
+            target.ModeFlag = template.ModeFlag;
+            target.Mode1Field0A = template.Mode1Field0A;
+            target.Mode1Field0B = template.Mode1Field0B;
+            target.ProgressValue32 = template.ProgressValue32;
+            target.FieldAfterValue32 = template.FieldAfterValue32;
+            target.ExpireDate = template.ExpireDate;
+            target.TailFlag = template.TailFlag;
         }
 
         internal static void DetachCreatedDetails(
@@ -275,7 +331,9 @@ namespace DfoServer.Game.Inventory
             core.InstanceValue = ServerRandom.Next();
             core.Durability = metadata != null ? metadata.Durability : (ushort)0;
             core.SealFlag = metadata != null && metadata.IsSealed ? (byte)1 : (byte)0;
-            core.ExpireTime = ResolveEquipmentExpireTime(core.ItemId);
+            var expireTime = ResolveEquipmentExpireTime(core.ItemId);
+            if (expireTime > 0)
+                core.ExpireTime = expireTime;
         }
 
         private static void ApplyAvatarDefaults(
@@ -300,7 +358,9 @@ namespace DfoServer.Game.Inventory
         private static void ApplyStackableDefaults(ItemCore core, int count)
         {
             core.Count = count;
-            core.ExpireTime = ResolveStackableExpireTime(core.ItemId);
+            var expireTime = ResolveStackableExpireTime(core.ItemId);
+            if (expireTime > 0)
+                core.ExpireTime = expireTime;
 
             if (ItemMetadataResolver.TryLoadStackableFile(core.ItemId, out var stackable)
                 && stackable.TradeLimit > 0)

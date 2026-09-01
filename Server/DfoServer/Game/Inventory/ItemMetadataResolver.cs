@@ -1,4 +1,6 @@
 using DfoServer.GameWorld;
+using DfoServer.Game.ItemUpgrade;
+using DfoServer.Infrastructure;
 using PvfLib;
 using System;
 using System.Collections.Concurrent;
@@ -22,6 +24,9 @@ namespace DfoServer.Game.Inventory
 
         public int SellGold { get; set; }
 
+        /// <summary>PVF item weight used by inventory-capacity checks.</summary>
+        public int Weight { get; set; }
+
         public ushort Durability { get; set; }
 
         public int StackLimit { get; set; }
@@ -41,6 +46,13 @@ namespace DfoServer.Game.Inventory
         public string ItemCategory { get; set; }
 
         public string AttachType { get; set; }
+
+        /// <summary>
+        /// Maximum number of successful transfers for PVF [trade limit] items.
+        /// The 86 client stores the remaining count in the high three bits of
+        /// the common inventory attr/extData0 byte.
+        /// </summary>
+        public int TradeLimitMax { get; set; }
 
         public IReadOnlyList<string> ImpossibleContents { get; set; } = Array.Empty<string>();
 
@@ -154,6 +166,10 @@ namespace DfoServer.Game.Inventory
             = new ConcurrentDictionary<int, Lazy<string>>();
         private static readonly ConcurrentDictionary<int, Lazy<byte>> EmblemSocketTypeCache
             = new ConcurrentDictionary<int, Lazy<byte>>();
+        private static readonly ConcurrentDictionary<int, Lazy<EquipmentFile>> EquipmentFileCache
+            = new ConcurrentDictionary<int, Lazy<EquipmentFile>>();
+        private static readonly ConcurrentDictionary<int, Lazy<StackableItemFile>> StackableFileCache
+            = new ConcurrentDictionary<int, Lazy<StackableItemFile>>();
         private static readonly Regex AvatarSocketRegex = new Regex(@"\[\s*([ABCDSM])\s+socket\s*\]", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private const string AvatarTypeSelectTag = "[avatar type select]";
         private const string AvatarTypeSelectEndTag = "[/avatar type select]";
@@ -167,6 +183,9 @@ namespace DfoServer.Game.Inventory
             _ = StackableList.Value;
         }
 
+        internal static bool AreItemListsWarmed
+            => EquipmentList.IsValueCreated && StackableList.IsValueCreated;
+
         public static ItemMetadata Resolve(int itemTemplateId)
         {
             return MetadataCache.GetOrAdd(
@@ -179,7 +198,8 @@ namespace DfoServer.Game.Inventory
             var equipmentEntry = EquipmentList.Value.GetById(itemTemplateId);
             if (equipmentEntry != null)
             {
-                var equipment = EquipmentFile.Parse(PvfArchiveAccessor.ReadText(Path.Combine("equipment", equipmentEntry.FilePath)));
+                if (!TryLoadEquipmentFile(itemTemplateId, out var equipment))
+                    return CreateUnknownMetadata();
                 ResolveNeedMaterial(equipment.NeedMaterial, out var equipmentNeedMatId, out var equipmentNeedMatCount);
                 // Keep legacy ordinary-NPC pricing intact.  Only entries that
                 // actually exchange [need material] use PVF's price correction.
@@ -201,6 +221,7 @@ namespace DfoServer.Game.Inventory
                     PvfFilePath = equipmentEntry.FilePath,
                     BuyGold = buyGold,
                     SellGold = sellGold,
+                    Weight = Math.Max(0, equipment.Weight),
                     Durability = (ushort)durability,
                     StackLimit = 1,
                     Grade = equipment.Grade,
@@ -218,7 +239,8 @@ namespace DfoServer.Game.Inventory
             var stackableEntry = StackableList.Value.GetById(itemTemplateId);
             if (stackableEntry != null)
             {
-                var stackable = StackableItemFile.Parse(PvfArchiveAccessor.ReadText(Path.Combine("stackable", stackableEntry.FilePath)));
+                if (!TryLoadStackableFile(itemTemplateId, out var stackable))
+                    return CreateUnknownMetadata();
                 var sellGold = stackable.Value >= 0
                     ? stackable.Value / 5
                     : (stackable.Price > 0 ? stackable.Price / 5 : 0);
@@ -249,6 +271,7 @@ namespace DfoServer.Game.Inventory
                     PvfFilePath = stackableEntry.FilePath,
                     BuyGold = buyGold,
                     SellGold = sellGold,
+                    Weight = Math.Max(0, stackable.Weight),
                     Durability = 0,
                     StackLimit = stackable.StackLimit,
                     NeedMaterialId = needMatId,
@@ -258,10 +281,16 @@ namespace DfoServer.Game.Inventory
                     Rarity = stackable.Rarity,
                     ItemCategory = stackable.ItemCategory,
                     AttachType = stackable.AttachType,
+                    TradeLimitMax = Math.Max(0, stackable.TradeLimit),
                     ImpossibleContents = stackable.ImpossibleContentItems,
                 };
             }
 
+            return CreateUnknownMetadata();
+        }
+
+        private static ItemMetadata CreateUnknownMetadata()
+        {
             return new ItemMetadata
             {
                 ItemKind = "special",
@@ -317,13 +346,70 @@ namespace DfoServer.Game.Inventory
 
         public static bool TryLoadEquipmentFile(int itemTemplateId, out EquipmentFile equipment)
         {
-            equipment = null;
-            var equipmentEntry = EquipmentList.Value.GetById(itemTemplateId);
-            if (equipmentEntry == null)
-                return false;
+            equipment = EquipmentFileCache.GetOrAdd(
+                itemTemplateId,
+                id => new Lazy<EquipmentFile>(() => LoadEquipmentFile(id))).Value;
+            return equipment != null;
+        }
 
-            equipment = EquipmentFile.Parse(PvfArchiveAccessor.ReadText(Path.Combine("equipment", equipmentEntry.FilePath)));
-            return true;
+        internal static bool IsTitleEquipment(int itemTemplateId)
+        {
+            return TryLoadEquipmentFile(itemTemplateId, out var equipment)
+                && EquipmentTypeInfo.ParseOrUnknown(equipment?.EquipmentType)
+                    == EquipmentType.TitleName;
+        }
+
+        internal static bool IsEquipmentUsableByJob(int itemTemplateId, byte characterJob)
+        {
+            if (!TryLoadEquipmentFile(itemTemplateId, out var equipment)
+                || equipment?.Root == null)
+            {
+                return false;
+            }
+
+            var labels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var usableJob in equipment.Root.GetChildren("usable job"))
+            {
+                foreach (var dataItem in usableJob.DataItems)
+                {
+                    foreach (Match match in Regex.Matches(
+                        dataItem.GetContent(equipment.Content) ?? string.Empty,
+                        @"\[(?<job>[^\]]+)\]",
+                        RegexOptions.IgnoreCase))
+                    {
+                        var label = match.Groups["job"].Value.Trim();
+                        if (label.Length > 0)
+                            labels.Add(label);
+                    }
+                }
+            }
+
+            if (labels.Count == 0 || labels.Contains("all"))
+                return true;
+
+            var jobLabel = ResolveCharacterJobLabel(characterJob);
+            return jobLabel.Length > 0 && labels.Contains(jobLabel);
+        }
+
+        private static string ResolveCharacterJobLabel(byte characterJob)
+        {
+            switch (characterJob)
+            {
+                case 0: return "swordman";
+                case 1: return "fighter";
+                case 2: return "gunner";
+                case 3: return "mage";
+                case 4: return "priest";
+                case 5: return "at gunner";
+                case 6: return "thief";
+                case 7: return "at fighter";
+                case 8: return "at mage";
+                case 9: return "demonic swordman";
+                case 10: return "creator mage";
+                case 11: return "at swordman";
+                case 12: return "knight";
+                default: return string.Empty;
+            }
         }
 
         public static bool TryLoadStackableFile(int itemTemplateId, out StackableItemFile stackable)
@@ -564,11 +650,7 @@ namespace DfoServer.Game.Inventory
                 return false;
             }
 
-            if (bead.MonsterCardId > 0)
-                enchantCardItemId = bead.MonsterCardId;
-            else if (bead.EnchantIndex > 0)
-                enchantCardItemId = bead.EnchantIndex;
-            else
+            if (!TryResolveBeadEnchantCardId(bead, out enchantCardItemId, out var requiresCardValidation))
             {
                 rejectReason = "bead has no monster card id/enchant index";
                 return false;
@@ -581,6 +663,14 @@ namespace DfoServer.Game.Inventory
                 return false;
             }
 
+            if (bead.BeadLimitedUsableItemIds != null
+                && bead.BeadLimitedUsableItemIds.Count > 0
+                && !bead.BeadLimitedUsableItemIds.Contains(targetItemTemplateId))
+            {
+                rejectReason = "target item id is not allowed by bead limited usable item";
+                return false;
+            }
+
             if (!TryGetEquipmentType(targetItemTemplateId, out var targetEquipmentType))
             {
                 rejectReason = "target is not found in equipment.lst";
@@ -588,41 +678,26 @@ namespace DfoServer.Game.Inventory
             }
 
             StackableItemFile card = null;
-            if (bead.MonsterCardId > 0)
+            if (requiresCardValidation)
             {
-                if (!TryLoadStackable(bead.MonsterCardId, out card))
+                if (!TryLoadStackable(enchantCardItemId, out card))
                 {
                     rejectReason = "monster card is not found in stackable.lst";
                     return false;
                 }
             }
             else
-            {
                 TryLoadStackable(enchantCardItemId, out card);
-            }
 
-            if (card != null)
-            {
-                // monster card 的 string data: 第一个是图片资源，后续是允许附魔的 equipment type。
-                var allowedTypes = ExtractAllowedEquipmentTypes(card.StringDataItems);
-                if (allowedTypes.Count > 0 && !allowedTypes.Contains(targetEquipmentType))
-                {
-                    rejectReason = "target equipment type is not allowed by monster card string data";
-                    return false;
-                }
-
-                if (card.EnchantTable.Count > 0 && !card.EnchantTable.Contains(enchantUpgradeCount))
-                {
-                    rejectReason = "enchant upgrade count is not allowed by monster card enchant table";
-                    return false;
-                }
-
-                if (card.EnchantTable.Count == 0 && enchantUpgradeCount != 0)
-                {
-                    rejectReason = "monster card has no enchant table for upgraded bead";
-                    return false;
-                }
-            }
+            if (card != null
+                && !TryValidateMonsterCardTargetMetadata(
+                    card,
+                    targetEquipmentType,
+                    enchantUpgradeCount,
+                    requireAllowedType: false,
+                    upgradedItemName: "bead",
+                    out rejectReason))
+                return false;
 
             if (card == null && enchantUpgradeCount != 0)
             {
@@ -631,6 +706,35 @@ namespace DfoServer.Game.Inventory
             }
 
             return true;
+        }
+
+        internal static bool TryValidateMonsterCardTarget(
+            int cardItemTemplateId,
+            int targetItemTemplateId,
+            byte enchantUpgradeCount,
+            out string rejectReason)
+        {
+            rejectReason = null;
+            if (!TryLoadStackable(cardItemTemplateId, out var card)
+                || !IsEnchanterCard(card))
+            {
+                rejectReason = "item is not a monster card";
+                return false;
+            }
+
+            if (!TryGetEquipmentType(targetItemTemplateId, out var targetEquipmentType))
+            {
+                rejectReason = "target is not found in equipment.lst";
+                return false;
+            }
+
+            return TryValidateMonsterCardTargetMetadata(
+                card,
+                targetEquipmentType,
+                enchantUpgradeCount,
+                requireAllowedType: true,
+                upgradedItemName: "card",
+                out rejectReason);
         }
 
         public static bool TryValidatePetEnchantByBeadTarget(int beadItemTemplateId, int targetItemTemplateId, byte enchantUpgradeCount, out int enchantCardItemId, out string rejectReason)
@@ -644,11 +748,7 @@ namespace DfoServer.Game.Inventory
                 return false;
             }
 
-            if (bead.MonsterCardId > 0)
-                enchantCardItemId = bead.MonsterCardId;
-            else if (bead.EnchantIndex > 0)
-                enchantCardItemId = bead.EnchantIndex;
-            else
+            if (!TryResolveBeadEnchantCardId(bead, out enchantCardItemId, out var requiresCardValidation))
             {
                 rejectReason = "bead has no monster card id/enchant index";
                 return false;
@@ -660,41 +760,35 @@ namespace DfoServer.Game.Inventory
                 return false;
             }
 
-            StackableItemFile card = null;
-            if (bead.MonsterCardId > 0)
+            if (bead.BeadLimitedUsableItemIds != null
+                && bead.BeadLimitedUsableItemIds.Count > 0
+                && !bead.BeadLimitedUsableItemIds.Contains(targetItemTemplateId))
             {
-                if (!TryLoadStackable(bead.MonsterCardId, out card))
+                rejectReason = "target item id is not allowed by bead limited usable item";
+                return false;
+            }
+
+            StackableItemFile card = null;
+            if (requiresCardValidation)
+            {
+                if (!TryLoadStackable(enchantCardItemId, out card))
                 {
                     rejectReason = "monster card is not found in stackable.lst";
                     return false;
                 }
             }
             else
-            {
                 TryLoadStackable(enchantCardItemId, out card);
-            }
 
-            if (card != null)
-            {
-                var allowedTypes = ExtractAllowedEquipmentTypes(card.StringDataItems);
-                if (allowedTypes.Count == 0 || !allowedTypes.Contains("[creature]"))
-                {
-                    rejectReason = "target equipment type is not allowed by monster card string data";
-                    return false;
-                }
-
-                if (card.EnchantTable.Count > 0 && !card.EnchantTable.Contains(enchantUpgradeCount))
-                {
-                    rejectReason = "enchant upgrade count is not allowed by monster card enchant table";
-                    return false;
-                }
-
-                if (card.EnchantTable.Count == 0 && enchantUpgradeCount != 0)
-                {
-                    rejectReason = "monster card has no enchant table for upgraded bead";
-                    return false;
-                }
-            }
+            if (card != null
+                && !TryValidateMonsterCardTargetMetadata(
+                    card,
+                    "[creature]",
+                    enchantUpgradeCount,
+                    requireAllowedType: true,
+                    upgradedItemName: "bead",
+                    out rejectReason))
+                return false;
 
             if (card == null && enchantUpgradeCount != 0)
             {
@@ -705,15 +799,98 @@ namespace DfoServer.Game.Inventory
             return true;
         }
 
-        private static bool TryLoadStackable(int itemTemplateId, out StackableItemFile stackable)
+        private static bool TryValidateMonsterCardTargetMetadata(
+            StackableItemFile card,
+            string targetEquipmentType,
+            byte enchantUpgradeCount,
+            bool requireAllowedType,
+            string upgradedItemName,
+            out string rejectReason)
         {
-            stackable = null;
-            var stackableEntry = StackableList.Value.GetById(itemTemplateId);
-            if (stackableEntry == null)
+            rejectReason = null;
+            var allowedTypes = ExtractAllowedEquipmentTypes(card.StringDataItems);
+            if ((requireAllowedType && allowedTypes.Count == 0)
+                || (allowedTypes.Count > 0 && !allowedTypes.Contains(targetEquipmentType)))
+            {
+                rejectReason = "target equipment type is not allowed by monster card string data";
+                return false;
+            }
+
+            if (card.EnchantTable.Count > 0)
+            {
+                if (!card.EnchantTable.Contains(enchantUpgradeCount))
+                {
+                    rejectReason = "enchant upgrade count is not allowed by monster card enchant table";
+                    return false;
+                }
+                return true;
+            }
+
+            if (enchantUpgradeCount != 0)
+            {
+                rejectReason = $"monster card has no enchant table for upgraded {upgradedItemName}";
+                return false;
+            }
+            return true;
+        }
+
+        private static bool TryResolveBeadEnchantCardId(
+            StackableItemFile bead,
+            out int enchantCardItemId,
+            out bool requiresCardValidation)
+        {
+            enchantCardItemId = 0;
+            requiresCardValidation = false;
+            if (bead == null)
                 return false;
 
-            stackable = StackableItemFile.Parse(PvfArchiveAccessor.ReadText(Path.Combine("stackable", stackableEntry.FilePath)));
+            if (TryPickMonsterCardId(bead, out enchantCardItemId))
+            {
+                requiresCardValidation = true;
+                return true;
+            }
+
+            if (bead.EnchantIndex > 0)
+            {
+                enchantCardItemId = bead.EnchantIndex;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryPickMonsterCardId(StackableItemFile bead, out int monsterCardItemId)
+        {
+            monsterCardItemId = 0;
+            if (bead == null)
+                return false;
+
+            var candidates = new List<int>();
+            if (bead.MonsterCardIds != null)
+            {
+                foreach (var itemId in bead.MonsterCardIds)
+                {
+                    if (itemId > 0)
+                        candidates.Add(itemId);
+                }
+            }
+            if (candidates.Count == 0 && bead.MonsterCardId > 0)
+                candidates.Add(bead.MonsterCardId);
+            if (candidates.Count == 0)
+                return false;
+
+            monsterCardItemId = candidates.Count == 1
+                ? candidates[0]
+                : candidates[ServerRandom.Next(candidates.Count)];
             return true;
+        }
+
+        private static bool TryLoadStackable(int itemTemplateId, out StackableItemFile stackable)
+        {
+            stackable = StackableFileCache.GetOrAdd(
+                itemTemplateId,
+                id => new Lazy<StackableItemFile>(() => LoadStackableFile(id))).Value;
+            return stackable != null;
         }
 
         private static bool TryGetEquipmentType(int itemTemplateId, out string equipmentType)
@@ -728,12 +905,27 @@ namespace DfoServer.Game.Inventory
 
         private static string LoadEquipmentType(LstFile equipmentList, int itemTemplateId)
         {
-            var equipmentEntry = equipmentList.GetById(itemTemplateId);
-            if (equipmentEntry == null)
+            if (!TryLoadEquipmentFile(itemTemplateId, out var equipment))
                 return null;
-
-            var equipment = EquipmentFile.Parse(PvfArchiveAccessor.ReadText(Path.Combine("equipment", equipmentEntry.FilePath)));
             return NormalizeEquipmentType(equipment.EquipmentType);
+        }
+
+        private static EquipmentFile LoadEquipmentFile(int itemTemplateId)
+        {
+            var entry = EquipmentList.Value.GetById(itemTemplateId);
+            return entry == null
+                ? null
+                : EquipmentFile.Parse(PvfArchiveAccessor.ReadText(
+                    Path.Combine("equipment", entry.FilePath)));
+        }
+
+        private static StackableItemFile LoadStackableFile(int itemTemplateId)
+        {
+            var entry = StackableList.Value.GetById(itemTemplateId);
+            return entry == null
+                ? null
+                : StackableItemFile.Parse(PvfArchiveAccessor.ReadText(
+                    Path.Combine("stackable", entry.FilePath)));
         }
 
         private static HashSet<string> ExtractAllowedEquipmentTypes(List<string> stringDataItems)
@@ -752,12 +944,61 @@ namespace DfoServer.Game.Inventory
             return result;
         }
 
+        private static string NormalizeItemCategory(string raw)
+            => (raw ?? string.Empty).Replace("`", string.Empty).Trim();
+
+        internal static bool IsMonsterCardCategory(string raw)
+        {
+            var normalized = NormalizeItemCategory(raw);
+            const string category = "monster card";
+            return normalized.StartsWith(category, StringComparison.OrdinalIgnoreCase)
+                && (normalized.Length == category.Length
+                    || char.IsWhiteSpace(normalized[category.Length]));
+        }
+
+        internal static bool IsMonsterCard(StackableItemFile card)
+        {
+            return card != null && IsMonsterCardCategory(card.ItemCategory);
+        }
+
+        internal static bool IsMonsterCardBead(StackableItemFile bead)
+        {
+            if (bead == null)
+                return false;
+
+            if (bead.MonsterCardIds != null)
+            {
+                foreach (var itemId in bead.MonsterCardIds)
+                {
+                    if (itemId > 0)
+                        return true;
+                }
+            }
+
+            return bead.MonsterCardId > 0;
+        }
+
+        internal static bool IsEnchanterCard(StackableItemFile card)
+        {
+            if (card == null)
+                return false;
+
+            var stackableType = NormalizeItemCategory(card.StackableType);
+            return IsMonsterCard(card)
+                || (string.Equals(
+                        stackableType,
+                        "[material expert job] 1",
+                        StringComparison.OrdinalIgnoreCase)
+                    && card.EnchantTable.Count > 0
+                    && ExtractAllowedEquipmentTypes(card.StringDataItems).Count > 0);
+        }
+
         private static bool HasDurabilityByType(string normalizedType)
         {
             if (string.IsNullOrEmpty(normalizedType))
                 return false;
             // 武器
-            if (normalizedType == "[weapon]" || normalizedType == "[support weapon]")
+            if (normalizedType == "[weapon]" || normalizedType == "[support weapon]" || normalizedType == "[charm]")
                 return true;
             // 防具
             if (normalizedType == "[coat]" || normalizedType == "[pants]"
@@ -837,6 +1078,13 @@ namespace DfoServer.Game.Inventory
 
         internal static bool IsAvatarItem(ItemMetadata metadata)
         {
+            var equipmentType = EquipmentTypeInfo.ParseOrUnknown(metadata?.EquipmentType);
+            if (equipmentType >= EquipmentType.HatAvatar
+                && equipmentType <= EquipmentType.WeaponAvatar)
+            {
+                return true;
+            }
+
             var path = metadata?.PvfFilePath;
             if (string.IsNullOrWhiteSpace(path))
                 return false;
@@ -884,10 +1132,10 @@ namespace DfoServer.Game.Inventory
             if (stackableType == "material expert job")
                 return ItemCore.KindExpertJobMaterial;
 
-            if (stackableType == "quest")
+            if (metadata.IsPrimaryStackableFamily("quest"))
                 return ItemCore.KindQuest;
 
-            if (stackableType == "material")
+            if (metadata.IsPrimaryStackableFamily("material"))
                 return IsSpecialMaterialItem(itemTemplateId)
                     ? ItemCore.KindSpecialMaterial
                     : ItemCore.KindMaterial;

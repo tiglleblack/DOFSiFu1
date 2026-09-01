@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using DfoServer.Game.Currency;
+using DfoServer.Game.ExpertJob;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.TitleBook;
 using Microsoft.Data.Sqlite;
@@ -573,7 +574,666 @@ CREATE TABLE IF NOT EXISTS character_tower_of_despair_progress (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
 );")),
+
+            (40, "mailbox persistence on ItemCore inventory", MigrateMailboxItemCore),
+            (41, "mailbox sender snapshot survives character deletion", MigrateMailboxSenderSnapshot),
+            (42, "mercenary expedition assignments and reward outbox", MigrateMercenaryExpedition),
+
+            (43, "quest progress CAS and event inbox", MigrateQuestProgressConcurrency),
+
+            (44, "daily challenge reward claims", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS character_daily_challenge_claims (
+    character_id INTEGER NOT NULL,
+    group_index INTEGER NOT NULL CHECK (group_index >= 0 AND group_index < 6),
+    claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, group_index),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);")),
+
+            (45, "dungeon persistent effect outbox", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS dungeon_persistent_effect_outbox (
+    source_event_id TEXT NOT NULL,
+    effect_kind TEXT NOT NULL,
+    effect_scope INTEGER NOT NULL,
+    scope_target INTEGER NOT NULL,
+    character_id INTEGER NOT NULL DEFAULT 0,
+    account_id INTEGER NOT NULL DEFAULT 0,
+    payload_version INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    state INTEGER NOT NULL DEFAULT 0 CHECK (state >= 0 AND state <= 4),
+    lease_id TEXT,
+    lease_owner TEXT,
+    lease_expires_at INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    result_version INTEGER,
+    result_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    committed_at INTEGER,
+    PRIMARY KEY (source_event_id, effect_kind, effect_scope, scope_target)
+);
+CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_character_state
+    ON dungeon_persistent_effect_outbox(character_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_account_state
+    ON dungeon_persistent_effect_outbox(account_id, state, updated_at);")),
+
+            (46, "character quest notify selections", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS character_quest_notify_selections (
+    character_id INTEGER NOT NULL,
+    slot_index INTEGER NOT NULL CHECK (slot_index >= 0 AND slot_index < 4),
+    quest_id INTEGER NOT NULL CHECK (quest_id > 0),
+    PRIMARY KEY (character_id, slot_index),
+    UNIQUE (character_id, quest_id),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);")),
+
+            (47, "account dungeon difficulty permissions", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS account_dungeon_permissions (
+    account_id INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL CHECK (dungeon_id > 0 AND dungeon_id <= 65535),
+    clear_state INTEGER NOT NULL CHECK (clear_state > 0 AND clear_state <= 255),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (account_id, dungeon_id),
+    FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+);")),
+
+            (48, "character expert job domain state", MigrateExpertJobState),
+            (49, "附魔师设备耐久", MigrateEnchanterEndurance),
+            (50, "quest activation identity and per-activation event inbox",
+                MigrateQuestActivationIdentity),
+            (51, "account increase chance lottery progress", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS account_increase_chance_lottery_progress (
+    account_id INTEGER NOT NULL,
+    item_template_id INTEGER NOT NULL,
+    reward_index INTEGER NOT NULL CHECK(reward_index >= 0 AND reward_index < 20),
+    PRIMARY KEY (account_id, item_template_id, reward_index),
+    FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+);")),
+            (52, "independent fair-PvP skill trees", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS character_pvp_skill_state (
+    character_id INTEGER PRIMARY KEY,
+    initialized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_pvp_skills (
+    character_id INTEGER NOT NULL,
+    page_index INTEGER NOT NULL CHECK (page_index >= 0 AND page_index <= 1),
+    slot INTEGER NOT NULL,
+    skill_id INTEGER NOT NULL,
+    level INTEGER NOT NULL,
+    extra_values BLOB,
+    PRIMARY KEY (character_id, page_index, slot),
+    UNIQUE (character_id, page_index, skill_id),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);")),
+
+            (53, "daily challenge entry reward claims", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS character_daily_challenge_entry_claims (
+    character_id INTEGER NOT NULL,
+    group_index INTEGER NOT NULL CHECK (group_index >= 0 AND group_index < 6),
+    entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+    quest_id INTEGER NOT NULL CHECK (quest_id > 0),
+    claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, group_index, entry_index),
+    FOREIGN KEY (character_id, group_index, entry_index)
+        REFERENCES character_daily_challenge_entries(character_id, group_index, entry_index)
+        ON DELETE CASCADE
+);")),
+
+            (54, "project claimed challenge entries into client clear flags", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS character_invisible_falgs (
+    character_id INTEGER NOT NULL,
+    slot_index INTEGER NOT NULL,
+    flag_value INTEGER NOT NULL,
+    PRIMARY KEY (character_id, slot_index),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+INSERT INTO character_invisible_falgs (character_id, slot_index, flag_value)
+SELECT character_id, quest_id, 1
+FROM character_daily_challenge_entry_claims
+WHERE 1 = 1
+ON CONFLICT(character_id, slot_index)
+DO UPDATE SET flag_value = excluded.flag_value;")),
+
+            (55, "daily challenge authoritative dungeon-clear events", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS character_daily_challenge_progress_events (
+    character_id INTEGER NOT NULL,
+    source_event_id TEXT NOT NULL,
+    group_index INTEGER NOT NULL CHECK (group_index >= 0 AND group_index < 6),
+    entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+    quest_id INTEGER NOT NULL CHECK (quest_id > 0),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, source_event_id, group_index, entry_index),
+    FOREIGN KEY (character_id, group_index, entry_index)
+        REFERENCES character_daily_challenge_entries(character_id, group_index, entry_index)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_daily_challenge_progress_events_character
+    ON character_daily_challenge_progress_events(character_id, created_at);")),
+
+            (56, "daily challenge special progress and settlement dedupe", conn => ExecuteBatch(conn, @"
+CREATE TABLE IF NOT EXISTS character_daily_challenge_special_state (
+    character_id INTEGER PRIMARY KEY,
+    challenge_type INTEGER NOT NULL CHECK (challenge_type > 0),
+    target_value INTEGER NOT NULL CHECK (target_value > 0),
+    progress_value INTEGER NOT NULL DEFAULT 0
+        CHECK (progress_value >= 0 AND progress_value <= target_value),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_daily_challenge_special_progress_events (
+    character_id INTEGER NOT NULL,
+    source_event_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, source_event_id),
+    FOREIGN KEY (character_id) REFERENCES character_daily_challenge_special_state(character_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_daily_challenge_special_events_character
+    ON character_daily_challenge_special_progress_events(character_id, created_at);")),
         };
+
+        internal static int LatestVersion =>
+            Steps.Length == 0 ? 0 : Steps[Steps.Length - 1].Version;
+
+        private static void MigrateEnchanterEndurance(SqliteConnection connection)
+        {
+            SqliteSchemaMigrator.EnsureColumns(
+                connection,
+                "character_expert_job",
+                new[]
+                {
+                    ("enchanter_endurance", "INTEGER NOT NULL DEFAULT 0 CHECK(enchanter_endurance >= 0)"),
+                });
+            if (!TableExists(connection, "character_subtype0_fields"))
+                return;
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = @"
+UPDATE character_expert_job
+SET enchanter_endurance=@endurance,
+    updated_at=CURRENT_TIMESTAMP
+WHERE enchanter_endurance=0
+  AND character_id IN (
+      SELECT character_id
+      FROM character_subtype0_fields
+      WHERE expert_job_type=1
+  );";
+                command.Parameters.AddWithValue(
+                    "@endurance",
+                    EnchanterConfigProvider.Config.InitialEndurance);
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private static void MigrateExpertJobState(SqliteConnection connection)
+        {
+            ExecuteBatch(connection, @"
+CREATE TABLE IF NOT EXISTS character_expert_job (
+    character_id INTEGER PRIMARY KEY,
+    giveup_count INTEGER NOT NULL DEFAULT 0 CHECK(giveup_count >= 0 AND giveup_count <= 65535),
+    disjoint_machine_grade INTEGER NOT NULL DEFAULT 0 CHECK(disjoint_machine_grade >= 0),
+    disjoint_machine_endurance INTEGER NOT NULL DEFAULT 0 CHECK(disjoint_machine_endurance >= 0),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_expert_job_recipes (
+    character_id INTEGER NOT NULL,
+    recipe_id INTEGER NOT NULL CHECK(recipe_id > 0),
+    PRIMARY KEY (character_id, recipe_id),
+    FOREIGN KEY (character_id) REFERENCES character_expert_job(character_id) ON DELETE CASCADE
+);");
+
+            var legacyStates = new List<(int CharacterId, byte Mode, ExpertJobState State)>();
+            var hasLegacyBlob = ColumnExists(
+                connection,
+                "character_init_flags",
+                "expert_job_blob");
+            var hasSubtype0Fields = TableExists(
+                connection,
+                "character_subtype0_fields");
+            if (hasLegacyBlob)
+            {
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = @"
+SELECT character_id, expert_job_blob
+FROM character_init_flags
+WHERE expert_job_blob IS NOT NULL;";
+                    using (var reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            var blob = reader.IsDBNull(1) ? null : (byte[])reader[1];
+                            if (!ExpertJobStateCodec.TryDecodeLegacyBlob(
+                                    blob,
+                                    out var mode,
+                                    out var state))
+                            {
+                                throw new InvalidOperationException(
+                                    $"invalid legacy expert job state: " +
+                                    $"cid={reader.GetInt32(0)} length={blob?.Length ?? 0}");
+                            }
+
+                            if (mode == 0)
+                                continue;
+                            legacyStates.Add((reader.GetInt32(0), mode, state));
+                        }
+                    }
+                }
+            }
+
+            using (var transaction = connection.BeginTransaction())
+            {
+                if (hasSubtype0Fields)
+                {
+                    ExecuteBatch(connection, transaction, @"
+INSERT OR IGNORE INTO character_expert_job (character_id)
+SELECT character_id
+FROM character_subtype0_fields
+WHERE expert_job_type > 0;");
+                }
+
+                foreach (var legacy in legacyStates)
+                {
+                    var machine = legacy.State.DisjointMachine;
+                    using (var command = connection.CreateCommand())
+                    {
+                        command.Transaction = transaction;
+                        command.CommandText = @"
+INSERT INTO character_expert_job (
+    character_id, giveup_count,
+    disjoint_machine_grade, disjoint_machine_endurance, updated_at)
+VALUES (@cid, @giveup, @grade, @endurance, CURRENT_TIMESTAMP)
+ON CONFLICT(character_id) DO UPDATE SET
+    giveup_count=excluded.giveup_count,
+    disjoint_machine_grade=excluded.disjoint_machine_grade,
+    disjoint_machine_endurance=excluded.disjoint_machine_endurance,
+    updated_at=CURRENT_TIMESTAMP;";
+                        command.Parameters.AddWithValue("@cid", legacy.CharacterId);
+                        command.Parameters.AddWithValue("@giveup", legacy.State.GiveUpCount);
+                        command.Parameters.AddWithValue(
+                            "@grade",
+                            legacy.Mode == ExpertJobStateCodec.DisjointerMode
+                                ? machine?.MachineGrade ?? 0
+                                : 0);
+                        command.Parameters.AddWithValue(
+                            "@endurance",
+                            legacy.Mode == ExpertJobStateCodec.DisjointerMode
+                                ? machine?.Endurance ?? 0
+                                : 0);
+                        command.ExecuteNonQuery();
+                    }
+
+                    if (legacy.Mode == ExpertJobStateCodec.DisjointerMode)
+                        continue;
+
+                    foreach (var recipeId in legacy.State.LearnedRecipeIds)
+                    {
+                        if (recipeId <= 0)
+                            continue;
+                        using (var command = connection.CreateCommand())
+                        {
+                            command.Transaction = transaction;
+                            command.CommandText = @"
+INSERT OR IGNORE INTO character_expert_job_recipes (character_id, recipe_id)
+VALUES (@cid, @recipe);";
+                            command.Parameters.AddWithValue("@cid", legacy.CharacterId);
+                            command.Parameters.AddWithValue("@recipe", recipeId);
+                            command.ExecuteNonQuery();
+                        }
+                    }
+                }
+
+                transaction.Commit();
+            }
+
+            if (hasLegacyBlob)
+            {
+                SqliteSchemaMigrator.DropColumnsIfExist(
+                    connection,
+                    "character_init_flags",
+                    "expert_job_blob");
+            }
+        }
+
+        private static void MigrateMercenaryExpedition(SqliteConnection connection)
+        {
+            ExecuteBatch(connection, @"
+CREATE TABLE IF NOT EXISTS account_mercenary_assignments (
+    assignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    character_id INTEGER NOT NULL UNIQUE,
+    character_level INTEGER NOT NULL,
+    start_time INTEGER NOT NULL,
+    finish_time INTEGER NOT NULL,
+    area_index INTEGER NOT NULL,
+    period_index INTEGER NOT NULL,
+    avatar_bonus_tier INTEGER NOT NULL DEFAULT 0,
+    status INTEGER NOT NULL DEFAULT 1,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE,
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_mercenary_assignments_account
+    ON account_mercenary_assignments(account_id, character_id);
+
+CREATE TABLE IF NOT EXISTS mercenary_reward_outbox (
+    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignment_id INTEGER NOT NULL UNIQUE,
+    mailbox_message_id INTEGER,
+    account_id INTEGER NOT NULL,
+    character_id INTEGER NOT NULL,
+    area_index INTEGER NOT NULL,
+    period_index INTEGER NOT NULL,
+    completed_hours INTEGER NOT NULL DEFAULT 0,
+    is_early_return INTEGER NOT NULL DEFAULT 0,
+    return_purpose INTEGER NOT NULL DEFAULT 0,
+    base_gold INTEGER NOT NULL DEFAULT 0,
+    bonus_gold INTEGER NOT NULL DEFAULT 0,
+    item_template_id INTEGER NOT NULL DEFAULT 0,
+    item_count INTEGER NOT NULL DEFAULT 0,
+    mail_title_key TEXT NOT NULL,
+    mail_message_key TEXT NOT NULL,
+    critical_multiplier_milli INTEGER NOT NULL DEFAULT 1000,
+    delivery_status TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    last_delivery_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    delivered_at TEXT,
+    FOREIGN KEY (mailbox_message_id) REFERENCES mailbox_messages(message_id) ON DELETE SET NULL,
+    FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE,
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_mercenary_outbox_delivery
+    ON mercenary_reward_outbox(delivery_status, outbox_id);
+
+CREATE TABLE IF NOT EXISTS mercenary_reward_items (
+    outbox_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    item_template_id INTEGER NOT NULL CHECK(item_template_id > 0),
+    item_count INTEGER NOT NULL CHECK(item_count > 0),
+    PRIMARY KEY (outbox_id, ordinal),
+    FOREIGN KEY (outbox_id) REFERENCES mercenary_reward_outbox(outbox_id) ON DELETE CASCADE
+);
+");
+        }
+
+        private static void MigrateMailboxItemCore(SqliteConnection connection)
+        {
+            SqliteSchemaMigrator.EnsureColumns(connection, "mailbox_messages", new[]
+            {
+                ("idempotency_key", "TEXT"),
+                ("request_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("unlimited_flag", "INTEGER NOT NULL DEFAULT 0"),
+            });
+            SqliteSchemaMigrator.EnsureColumns(connection, "mailbox_recipients", new[]
+            {
+                ("saved_flag", "INTEGER NOT NULL DEFAULT 0"),
+                ("saved_at", "TEXT"),
+            });
+            SqliteSchemaMigrator.EnsureColumns(connection, "mailbox_attachments", new[]
+            {
+                ("item_core", "BLOB"),
+                ("detail_json", "TEXT NOT NULL DEFAULT ''"),
+            });
+            SqliteSchemaMigrator.EnsureColumns(connection, "mailbox_campaigns", new[]
+            {
+                ("max_character_id", "INTEGER NOT NULL DEFAULT 0"),
+            });
+
+            ExecuteBatch(connection, @"
+UPDATE mailbox_messages
+SET unlimited_flag = 1
+WHERE unlimited_flag = 0
+  AND mail_type != 0
+  AND expire_at >= '9999-01-01 00:00:00';
+
+DROP INDEX IF EXISTS idx_mailbox_messages_expiry;
+CREATE INDEX idx_mailbox_messages_expiry
+    ON mailbox_messages(unlimited_flag, expire_at, message_id);
+CREATE INDEX IF NOT EXISTS idx_mailbox_recipients_character_state
+    ON mailbox_recipients(character_id, folder, saved_flag, deleted_flag, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_mailbox_messages_idempotency
+    ON mailbox_messages(sender_character_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_mailbox_attachments_message_ordinal
+    ON mailbox_attachments(message_id, ordinal);
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_messages_validate_insert
+BEFORE INSERT ON mailbox_messages
+WHEN NEW.gold < 0 OR NEW.fee_gold < 0
+BEGIN
+    SELECT RAISE(ABORT, 'invalid mailbox money');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_messages_validate_update
+BEFORE UPDATE OF gold, fee_gold ON mailbox_messages
+WHEN NEW.gold < 0 OR NEW.fee_gold < 0
+BEGIN
+    SELECT RAISE(ABORT, 'invalid mailbox money');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_attachments_validate_insert
+BEFORE INSERT ON mailbox_attachments
+WHEN NEW.item_template_id <= 0 OR NEW.item_count <= 0 OR NEW.claimed_flag NOT IN (0, 1, 2)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid mailbox attachment');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_attachments_validate_update
+BEFORE UPDATE OF item_template_id, item_count, claimed_flag ON mailbox_attachments
+WHEN NEW.item_template_id <= 0 OR NEW.item_count <= 0 OR NEW.claimed_flag NOT IN (0, 1, 2)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid mailbox attachment');
+END;");
+        }
+
+        private static void MigrateMailboxSenderSnapshot(SqliteConnection connection)
+        {
+            if (!TableSqlContains(connection, "mailbox_messages", "FOREIGN KEY (sender_character_id)"))
+                return;
+
+            bool foreignKeysEnabled;
+            using (var command = new SqliteCommand("PRAGMA foreign_keys;", connection))
+                foreignKeysEnabled = Convert.ToInt32(command.ExecuteScalar()) != 0;
+            if (foreignKeysEnabled)
+                ExecuteBatch(connection, "PRAGMA foreign_keys=OFF;");
+
+            try
+            {
+                using (var transaction = connection.BeginTransaction())
+                {
+                    ExecuteBatch(connection, transaction, @"
+DROP TABLE IF EXISTS mailbox_messages_v41;
+CREATE TABLE mailbox_messages_v41 (
+    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_character_id INTEGER NOT NULL,
+    sender_account_id INTEGER NOT NULL DEFAULT 0,
+    sender_name TEXT NOT NULL DEFAULT '',
+    receiver_character_id INTEGER NOT NULL,
+    receiver_account_id INTEGER NOT NULL DEFAULT 0,
+    receiver_name TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    gold INTEGER NOT NULL DEFAULT 0 CHECK(gold >= 0),
+    fee_gold INTEGER NOT NULL DEFAULT 0 CHECK(fee_gold >= 0),
+    mail_type INTEGER NOT NULL DEFAULT 0,
+    source_protocol INTEGER NOT NULL DEFAULT 0,
+    idempotency_key TEXT,
+    request_hash TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    unlimited_flag INTEGER NOT NULL DEFAULT 0 CHECK(unlimited_flag IN (0, 1)),
+    expire_at TEXT NOT NULL,
+    deleted_by_sender INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (receiver_character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+INSERT INTO mailbox_messages_v41 (
+    message_id, sender_character_id, sender_account_id, sender_name,
+    receiver_character_id, receiver_account_id, receiver_name,
+    title, body, gold, fee_gold, mail_type, source_protocol,
+    idempotency_key, request_hash, created_at, unlimited_flag,
+    expire_at, deleted_by_sender
+)
+SELECT
+    message_id, sender_character_id, sender_account_id, sender_name,
+    receiver_character_id, receiver_account_id, receiver_name,
+    title, body, gold, fee_gold, mail_type, source_protocol,
+    idempotency_key, request_hash, created_at, unlimited_flag,
+    expire_at, deleted_by_sender
+FROM mailbox_messages;
+DROP TABLE mailbox_messages;
+ALTER TABLE mailbox_messages_v41 RENAME TO mailbox_messages;
+
+CREATE INDEX idx_mailbox_messages_receiver_created
+    ON mailbox_messages(receiver_character_id, created_at);
+CREATE INDEX idx_mailbox_messages_sender_created
+    ON mailbox_messages(sender_character_id, created_at);
+CREATE INDEX idx_mailbox_messages_expiry
+    ON mailbox_messages(unlimited_flag, expire_at, message_id);
+CREATE UNIQUE INDEX ux_mailbox_messages_idempotency
+    ON mailbox_messages(sender_character_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+CREATE TRIGGER trg_mailbox_messages_validate_insert
+BEFORE INSERT ON mailbox_messages
+WHEN NEW.gold < 0 OR NEW.fee_gold < 0
+BEGIN
+    SELECT RAISE(ABORT, 'invalid mailbox money');
+END;
+CREATE TRIGGER trg_mailbox_messages_validate_update
+BEFORE UPDATE OF gold, fee_gold ON mailbox_messages
+WHEN NEW.gold < 0 OR NEW.fee_gold < 0
+BEGIN
+    SELECT RAISE(ABORT, 'invalid mailbox money');
+END;");
+                    transaction.Commit();
+                }
+            }
+            finally
+            {
+                if (foreignKeysEnabled)
+                    ExecuteBatch(connection, "PRAGMA foreign_keys=ON;");
+            }
+        }
+
+        private static void MigrateQuestProgressConcurrency(SqliteConnection connection)
+        {
+            SqliteSchemaMigrator.EnsureColumns(
+                connection,
+                "character_active_quests",
+                new[]
+                {
+                    ("version", "INTEGER NOT NULL DEFAULT 0"),
+                });
+            ExecuteBatch(connection, @"
+DELETE FROM character_active_quests
+WHERE rowid NOT IN (
+    SELECT MIN(rowid)
+    FROM character_active_quests
+    GROUP BY character_id, quest_id
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_character_active_quests_identity
+    ON character_active_quests(character_id, quest_id);
+CREATE TABLE IF NOT EXISTS quest_progress_event_inbox (
+    character_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, event_id, event_kind),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);");
+        }
+
+        private static void MigrateQuestActivationIdentity(
+            SqliteConnection connection)
+        {
+            SqliteSchemaMigrator.EnsureColumns(
+                connection,
+                "character_active_quests",
+                new[]
+                {
+                    ("activation_id", "TEXT NOT NULL DEFAULT ''"),
+                });
+
+            var inboxHasActivation = HasColumn(
+                connection,
+                "quest_progress_event_inbox",
+                "activation_id");
+            using (var transaction = connection.BeginTransaction())
+            {
+                ExecuteBatch(connection, transaction, @"
+UPDATE character_active_quests
+SET activation_id = lower(hex(randomblob(16)))
+WHERE activation_id IS NULL OR activation_id = '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_character_active_quests_activation
+    ON character_active_quests(character_id, activation_id);
+DROP TABLE IF EXISTS quest_progress_event_inbox_v50;
+CREATE TABLE quest_progress_event_inbox_v50 (
+    character_id INTEGER NOT NULL,
+    activation_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, activation_id, event_id, event_kind),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);");
+
+                ExecuteBatch(
+                    connection,
+                    transaction,
+                    inboxHasActivation
+                        ? @"
+INSERT OR IGNORE INTO quest_progress_event_inbox_v50
+    (character_id, activation_id, event_id, event_kind, created_at)
+SELECT character_id, activation_id, event_id, event_kind, created_at
+FROM quest_progress_event_inbox
+WHERE activation_id IS NOT NULL AND activation_id <> '';"
+                        : @"
+INSERT OR IGNORE INTO quest_progress_event_inbox_v50
+    (character_id, activation_id, event_id, event_kind, created_at)
+SELECT inbox.character_id,
+       active.activation_id,
+       inbox.event_id,
+       inbox.event_kind,
+       inbox.created_at
+FROM quest_progress_event_inbox AS inbox
+JOIN character_active_quests AS active
+  ON active.character_id = inbox.character_id;");
+
+                ExecuteBatch(connection, transaction, @"
+DROP TABLE quest_progress_event_inbox;
+ALTER TABLE quest_progress_event_inbox_v50
+    RENAME TO quest_progress_event_inbox;");
+                transaction.Commit();
+            }
+        }
+
+        private static bool HasColumn(
+            SqliteConnection connection,
+            string tableName,
+            string columnName)
+        {
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = $"PRAGMA table_info({tableName});";
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        if (string.Equals(
+                                reader.GetString(1),
+                                columnName,
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
 
         private static void MigrateKnightShieldDeck(SqliteConnection connection)
         {

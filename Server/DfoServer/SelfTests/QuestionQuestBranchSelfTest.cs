@@ -45,6 +45,10 @@ namespace DfoServer.SelfTests
             var connStr = SqliteDatabaseBootstrap.BuildConnectionString(dbPath);
             var questService = new QuestService(connStr);
             var failures = 0;
+            var sessionId = Guid.NewGuid();
+            InventoryContext.Register(
+                sessionId,
+                new InventoryService(CharacterId, AccountId));
 
             Check("1862 is question quest", GameWorld.QuestData.IsQuestionQuest(BranchQuestionQuestId), ref failures);
             Check("1862 has two answer-dependent successors", GameWorld.QuestData.GetQuestionAnswerCount(BranchQuestionQuestId) == 2, ref failures);
@@ -57,7 +61,9 @@ namespace DfoServer.SelfTests
             Check("1862 starts with trigger 1", TryReadAcceptTrigger(acceptQuestionForPrincess, out var firstInitTrigger) && firstInitTrigger == 1, ref failures);
 
             questService.HandleSetTrigger(CharacterId, BuildSetTriggerBody(BranchQuestionQuestId, increment: false));
-            var finishPrincessChoice = questService.HandleFinishQuest(CharacterId,
+            var finishPrincessChoice = QuestSelfTestCommandAdapter.HandleFinish(
+                questService,
+                CharacterId,
                 BuildFinishBody(BranchQuestionQuestId, ushort.MaxValue));
             Check("finish 1862 after first answer succeeds", IsSuccessAck(finishPrincessChoice), ref failures);
             Check("1862 stores first answer as flag 1", LoadQuestFlag(connStr, BranchQuestionQuestId) == 1, ref failures);
@@ -70,7 +76,9 @@ namespace DfoServer.SelfTests
             Check("accept 1862 for prince branch succeeds", IsSuccessAck(acceptQuestionForPrince), ref failures);
 
             questService.HandleSetTrigger(CharacterId, BuildSetTriggerBody(BranchQuestionQuestId, increment: true));
-            var finishPrinceChoice = questService.HandleFinishQuest(CharacterId,
+            var finishPrinceChoice = QuestSelfTestCommandAdapter.HandleFinish(
+                questService,
+                CharacterId,
                 BuildFinishBody(BranchQuestionQuestId, 0));
             Check("finish 1862 after second answer succeeds even with reward index zero", IsSuccessAck(finishPrinceChoice), ref failures);
             Check("1862 stores second answer trigger as flag 2", LoadQuestFlag(connStr, BranchQuestionQuestId) == 2, ref failures);
@@ -84,6 +92,8 @@ namespace DfoServer.SelfTests
                 BuildQuestBody(PrinceBranchQuestId), AccountId);
             Check("direct accept of chosen 1864 succeeds", IsSuccessAck(acceptCorrectBranch), ref failures);
 
+            InventoryContext.Unregister(sessionId, CharacterId);
+
             Console.WriteLine(failures == 0 ? "PASS" : $"FAIL: {failures}");
             return failures == 0 ? 0 : 1;
         }
@@ -95,13 +105,12 @@ namespace DfoServer.SelfTests
             return body;
         }
 
-        private static byte[] BuildFinishBody(ushort questId, ushort rewardSelectIdx)
-        {
-            var body = new byte[4];
-            BitConverter.GetBytes(questId).CopyTo(body, 0);
-            BitConverter.GetBytes(rewardSelectIdx).CopyTo(body, 2);
-            return body;
-        }
+        private static byte[] BuildFinishBody(
+            ushort questId,
+            ushort rewardSelectIdx) =>
+            QuestSelfTestCommandAdapter.BuildFinishBody(
+                questId,
+                rewardSelectIdx);
 
         private static byte[] BuildSetTriggerBody(ushort questId, bool increment)
         {
